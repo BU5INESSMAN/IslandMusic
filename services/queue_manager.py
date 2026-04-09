@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramRetryAfter
@@ -10,6 +11,7 @@ from aiogram.types import FSInputFile
 
 from config import config
 from services.downloader import TrackInfo, cleanup_file
+from services.progress import BatchProgress, BatchStatus
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +51,8 @@ class QueueManager:
                 if batch_count >= config.max_files_per_batch:
                     batch_count = 0
                     logger.info(
-                        "Batch limit reached, pausing for %d seconds",
+                        "Batch limit reached (%d files), pausing for %ds",
+                        config.max_files_per_batch,
                         config.batch_delay_seconds,
                     )
                     await asyncio.sleep(config.batch_delay_seconds)
@@ -59,11 +62,25 @@ class QueueManager:
                 cleanup_file(item.track.filepath)
                 self._queue.task_done()
 
-    async def send_document(self, chat_id: int, filepath: str, caption: str) -> None:
-        """Send a file as a Telegram document (e.g. a ZIP archive) with retries."""
+    async def send_document(
+        self,
+        chat_id: int,
+        filepath: str,
+        caption: str,
+        progress: BatchProgress | None = None,
+    ) -> None:
         if not os.path.exists(filepath):
             logger.error("Document not found: %s", filepath)
             return
+
+        if progress:
+            progress.status = BatchStatus.SENDING
+
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        logger.info(
+            "Starting document upload to chat %d: %s (%.1fMB)",
+            chat_id, filepath, size_mb,
+        )
 
         doc_file = FSInputFile(filepath)
 
@@ -75,11 +92,13 @@ class QueueManager:
                     caption=caption,
                     parse_mode="HTML",
                 )
-                logger.info("Sent document '%s' to chat %d", filepath, chat_id)
+                logger.info(
+                    "Successfully sent document '%s' to chat %d", filepath, chat_id
+                )
                 return
             except TelegramRetryAfter as e:
                 logger.warning(
-                    "Rate limited, retrying after %d seconds", e.retry_after
+                    "Rate limited on document send, retrying after %ds", e.retry_after
                 )
                 await asyncio.sleep(e.retry_after)
             except Exception:
@@ -96,6 +115,10 @@ class QueueManager:
             return
 
         audio_file = FSInputFile(item.track.filepath)
+        logger.info(
+            "Sending audio '%s - %s' to chat %d",
+            item.track.artist, item.track.title, item.chat_id,
+        )
 
         for attempt in range(5):
             try:
@@ -109,12 +132,13 @@ class QueueManager:
                     parse_mode="HTML",
                 )
                 logger.info(
-                    "Sent '%s' to chat %d", item.track.title, item.chat_id
+                    "Successfully sent '%s' to chat %d",
+                    item.track.title, item.chat_id,
                 )
                 return
             except TelegramRetryAfter as e:
                 logger.warning(
-                    "Rate limited, retrying after %d seconds", e.retry_after
+                    "Rate limited, retrying after %ds", e.retry_after
                 )
                 await asyncio.sleep(e.retry_after)
             except Exception:

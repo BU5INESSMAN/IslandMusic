@@ -1,15 +1,19 @@
+from __future__ import annotations
+
 import asyncio
 import glob
 import logging
 import os
 import re
 import uuid
+import zipfile
 from dataclasses import dataclass
 
 import aiohttp
 import yt_dlp
 
 from config import config
+from services.progress import BatchProgress, BatchStatus
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +33,13 @@ _OG_TITLE_RE = re.compile(
 )
 _HTML_TITLE_RE = re.compile(r"<title[^>]*>([^<]+)</title>", re.IGNORECASE)
 
-# Junk suffixes that streaming sites append to their page titles
 _TITLE_JUNK = re.compile(
     r"\s*[\-\|–—]\s*(?:Spotify|Яндекс[\s.]?Музыка|Yandex[\s.]?Music|"
     r"Слушайте на|Listen on|Deezer).*$",
     re.IGNORECASE,
 )
+
+_UNSAFE_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
 
 
 @dataclass
@@ -47,20 +52,17 @@ class TrackInfo:
     thumbnail: str | None = None
 
 
+# ── URL helpers ───────────────────────────────────────────────────────
+
 def is_url(text: str) -> bool:
     return bool(URL_PATTERN.search(text))
 
 
 def _is_drm_url(url: str) -> bool:
-    """Check if a URL belongs to a DRM-protected / geo-blocked platform."""
     return any(pat.search(url) for pat in _DRM_DOMAINS)
 
 
 async def extract_metadata_from_url(url: str) -> str:
-    """Fetch the page at *url* and pull an 'Artist - Title' string from HTML
-    meta tags.  Returns the cleaned string suitable for ``ytsearch1:`` or
-    raises ``ValueError`` if nothing useful could be extracted."""
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -69,7 +71,6 @@ async def extract_metadata_from_url(url: str) -> str:
         ),
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     }
-
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -82,7 +83,6 @@ async def extract_metadata_from_url(url: str) -> str:
     except aiohttp.ClientError as exc:
         raise ValueError(f"Network error fetching {url}: {exc}") from exc
 
-    # Try og:title first – it usually carries "Artist – Track"
     match = _OG_TITLE_RE.search(html)
     if not match:
         match = _HTML_TITLE_RE.search(html)
@@ -90,15 +90,15 @@ async def extract_metadata_from_url(url: str) -> str:
         raise ValueError(f"Could not extract title from {url}")
 
     raw_title = match.group(1).strip()
-    # Strip platform-specific suffixes
     cleaned = _TITLE_JUNK.sub("", raw_title).strip()
-
     if not cleaned:
         raise ValueError(f"Empty title after cleanup from {url}")
 
     logger.info("Extracted metadata from URL %s -> '%s'", url, cleaned)
     return cleaned
 
+
+# ── yt-dlp option builders ────────────────────────────────────────────
 
 def _build_yt_dlp_opts(output_dir: str, filename_prefix: str) -> dict:
     return {
@@ -140,6 +140,8 @@ def _build_album_opts(output_dir: str, filename_prefix: str) -> dict:
     return opts
 
 
+# ── Core sync helpers ─────────────────────────────────────────────────
+
 def _extract_info(opts: dict, query: str) -> dict:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(query, download=True)
@@ -148,8 +150,7 @@ def _extract_info(opts: dict, query: str) -> dict:
 
 def _find_downloaded_mp3(output_dir: str, prefix: str) -> list[str]:
     pattern = os.path.join(output_dir, f"{prefix}_*.mp3")
-    files = sorted(glob.glob(pattern))
-    return files
+    return sorted(glob.glob(pattern))
 
 
 def _parse_track_info(info: dict, filepath: str) -> TrackInfo:
@@ -163,10 +164,9 @@ def _parse_track_info(info: dict, filepath: str) -> TrackInfo:
     )
 
 
-async def download_track(query: str) -> TrackInfo:
-    """Download a single track.  DRM/geo-blocked URLs are intercepted and
-    converted to a YouTube text search automatically."""
+# ── Single-track download ────────────────────────────────────────────
 
+async def download_track(query: str) -> TrackInfo:
     prefix = uuid.uuid4().hex[:8]
     output_dir = config.downloads_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -174,31 +174,71 @@ async def download_track(query: str) -> TrackInfo:
     search_query = query
 
     if is_url(query) and _is_drm_url(query):
-        # Intercept: scrape metadata, then search YouTube instead
         logger.info("DRM/geo-blocked URL detected, extracting metadata: %s", query)
         extracted = await extract_metadata_from_url(query)
         opts = _build_search_opts(output_dir, prefix)
         search_query = f"{extracted} Official Audio"
     elif is_url(query):
         opts = _build_yt_dlp_opts(output_dir, prefix)
-        search_query = query
     else:
         opts = _build_search_opts(output_dir, prefix)
         search_query = f"{query} Official Audio"
 
+    logger.info("Starting download: '%s'", search_query)
     info = await asyncio.to_thread(_extract_info, opts, search_query)
 
     files = _find_downloaded_mp3(output_dir, prefix)
     if not files:
         raise FileNotFoundError(f"No MP3 file found after downloading: {query}")
 
-    return _parse_track_info(info, files[0])
+    track = _parse_track_info(info, files[0])
+    logger.info("Finished download: '%s - %s'", track.artist, track.title)
+    return track
 
 
-async def download_album(url: str) -> list[TrackInfo]:
-    """Download a full album/playlist.  DRM URLs are not supported for album
-    mode — they must be handled track-by-track by the caller."""
+# ── Batch download (with progress) ───────────────────────────────────
 
+async def download_batch(
+    queries: list[str],
+    progress: BatchProgress,
+) -> list[TrackInfo]:
+    """Download a list of queries one-by-one, updating *progress* after each.
+
+    Failed tracks are logged and skipped — the process continues.
+    """
+    downloaded: list[TrackInfo] = []
+
+    for i, query in enumerate(queries, 1):
+        progress.current_track = query
+        logger.info(
+            "Starting download for track [%d] of [%d]: '%s'",
+            i, progress.total, query,
+        )
+        try:
+            track = await download_track(query)
+            downloaded.append(track)
+            progress.done += 1
+            logger.info(
+                "Finished downloading/converting track [%d]: '%s - %s'",
+                i, track.artist, track.title,
+            )
+        except Exception as exc:
+            progress.failed += 1
+            logger.error(
+                "Failed to download track [%d] of [%d] ('%s'): %s",
+                i, progress.total, query, exc,
+            )
+
+    progress.current_track = ""
+    return downloaded
+
+
+# ── Album download (with progress) ───────────────────────────────────
+
+async def download_album(
+    url: str,
+    progress: BatchProgress | None = None,
+) -> list[TrackInfo]:
     prefix = uuid.uuid4().hex[:8]
     output_dir = config.downloads_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -211,6 +251,7 @@ async def download_album(url: str) -> list[TrackInfo]:
 
     opts = _build_album_opts(output_dir, prefix)
 
+    logger.info("Starting album download: %s", url)
     info = await asyncio.to_thread(_extract_info, opts, url)
     entries = info.get("entries") or []
 
@@ -221,8 +262,17 @@ async def download_album(url: str) -> list[TrackInfo]:
     tracks: list[TrackInfo] = []
     for i, filepath in enumerate(files):
         entry_info = entries[i] if i < len(entries) else info
-        tracks.append(_parse_track_info(entry_info, filepath))
+        track = _parse_track_info(entry_info, filepath)
+        tracks.append(track)
+        if progress:
+            progress.done += 1
+            progress.current_track = f"{track.artist} - {track.title}"
+            logger.info(
+                "Finished downloading/converting track [%d] of [%d]: '%s - %s'",
+                i + 1, progress.total, track.artist, track.title,
+            )
 
+    logger.info("Album download complete: %d tracks from %s", len(tracks), url)
     return tracks
 
 
@@ -238,6 +288,8 @@ async def get_album_info(url: str) -> dict:
         return info or {}
 
 
+# ── File cleanup ──────────────────────────────────────────────────────
+
 def cleanup_file(filepath: str) -> None:
     try:
         if os.path.exists(filepath):
@@ -252,27 +304,41 @@ def cleanup_files(filepaths: list[str]) -> None:
         cleanup_file(fp)
 
 
-def _create_zip(tracks: list[TrackInfo], archive_name: str) -> str:
-    """Synchronous ZIP creation — call via asyncio.to_thread()."""
-    import zipfile
+# ── ZIP archiving (with progress) ────────────────────────────────────
 
+def _create_zip(
+    tracks: list[TrackInfo],
+    archive_name: str,
+    progress: BatchProgress | None = None,
+) -> str:
     archive_path = os.path.join(config.downloads_dir, archive_name)
+    logger.info("Starting ZIP compression: %s (%d tracks)", archive_name, len(tracks))
+
+    if progress:
+        progress.status = BatchStatus.ARCHIVING
+        progress.current_track = ""
+
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for i, track in enumerate(tracks, 1):
             if not os.path.exists(track.filepath):
                 logger.warning("Skipping missing file: %s", track.filepath)
                 continue
-            # Name inside the archive: "01 - Artist - Title.mp3"
             ext = os.path.splitext(track.filepath)[1]
             arc_name = f"{i:02d} - {track.artist} - {track.title}{ext}"
-            # Sanitise characters that are invalid in ZIP entry names
-            arc_name = re.sub(r'[<>:"/\\|?*]', "_", arc_name)
+            arc_name = _UNSAFE_CHARS_RE.sub("_", arc_name)
             zf.write(track.filepath, arc_name)
 
-    logger.info("Created ZIP archive: %s (%d tracks)", archive_path, len(tracks))
+    size_mb = os.path.getsize(archive_path) / (1024 * 1024)
+    logger.info(
+        "Finished ZIP compression. File size: %.1fMB (%s)",
+        size_mb, archive_path,
+    )
     return archive_path
 
 
-async def create_zip_archive(tracks: list[TrackInfo], archive_name: str) -> str:
-    """Compress *tracks* into a ZIP in a thread pool.  Returns the archive path."""
-    return await asyncio.to_thread(_create_zip, tracks, archive_name)
+async def create_zip_archive(
+    tracks: list[TrackInfo],
+    archive_name: str,
+    progress: BatchProgress | None = None,
+) -> str:
+    return await asyncio.to_thread(_create_zip, tracks, archive_name, progress)

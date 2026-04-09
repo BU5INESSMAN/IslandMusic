@@ -1,5 +1,9 @@
+from __future__ import annotations
+
+import asyncio
 import logging
 import os
+import re
 from datetime import datetime
 
 from aiogram import Bot, F, Router
@@ -9,13 +13,14 @@ from yt_dlp.utils import DownloadError, ExtractorError
 from handlers.texts import (
     ALBUM_COMPLETE,
     ALBUM_FOUND,
+    BATCH_ERROR,
+    BATCH_START,
     DOWNLOAD_COMPLETE,
     DRM_ERROR_TEXT,
     ERROR_TEXT,
     TXT_PARSING,
     WAIT_TEXT,
     ZIP_COMPLETE,
-    ZIP_CREATING,
     ZIP_THRESHOLD_NOTICE,
 )
 from services.downloader import (
@@ -24,18 +29,22 @@ from services.downloader import (
     cleanup_files,
     create_zip_archive,
     download_album,
+    download_batch,
     download_track,
     get_album_info,
     is_url,
 )
+from services.progress import BatchProgress, BatchStatus
 from services.queue_manager import QueueItem, QueueManager
 
 logger = logging.getLogger(__name__)
 router = Router()
 
 ZIP_THRESHOLD = 10
+PROGRESS_UPDATE_INTERVAL = 10  # seconds
 
 _DRM_KEYWORDS = ("drm", "451", "geo", "unavailable for legal", "not available")
+_UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def _is_drm_error(exc: Exception) -> bool:
@@ -51,15 +60,39 @@ def _get_queue_manager(bot: Bot) -> QueueManager:
 
 
 def _sanitize_filename(name: str) -> str:
-    """Remove characters that are unsafe for filenames."""
-    import re
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip("_ ")
+    return _UNSAFE_FILENAME_RE.sub("_", name).strip("_ ")
 
+
+# ── Progress updater ──────────────────────────────────────────────────
+
+async def _run_progress_updater(
+    status_msg: Message,
+    progress: BatchProgress,
+) -> None:
+    """Background task: edits *status_msg* every PROGRESS_UPDATE_INTERVAL
+    seconds with the current state of *progress*.  Stops when
+    ``progress.finished`` is set to ``True``."""
+
+    last_text = ""
+    while not progress.finished:
+        await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+        if progress.finished:
+            break
+        new_text = progress.format_message()
+        # Only edit if text actually changed (avoids "message not modified" errors)
+        if new_text != last_text:
+            try:
+                await status_msg.edit_text(new_text, parse_mode="HTML")
+                last_text = new_text
+            except Exception:
+                logger.debug("Could not update progress message", exc_info=True)
+
+
+# ── Batch helpers ─────────────────────────────────────────────────────
 
 async def _send_tracks_individually(
-    tracks: list[TrackInfo], chat_id: int, bot: Bot
+    tracks: list[TrackInfo], chat_id: int, bot: Bot,
 ) -> None:
-    """Enqueue tracks to be sent one-by-one as audio files."""
     queue = _get_queue_manager(bot)
     items = [
         QueueItem(
@@ -77,38 +110,93 @@ async def _send_tracks_as_zip(
     chat_id: int,
     bot: Bot,
     archive_label: str,
-    message: Message,
+    progress: BatchProgress,
 ) -> None:
-    """Compress tracks into a ZIP, send it as a document, then clean up everything."""
     safe_label = _sanitize_filename(archive_label) or "batch"
     archive_name = f"IslandMusic_{safe_label}.zip"
-
-    status_msg = await message.answer(ZIP_CREATING, parse_mode="HTML")
 
     track_paths = [t.filepath for t in tracks]
     zip_path: str | None = None
 
     try:
-        zip_path = await create_zip_archive(tracks, archive_name)
+        zip_path = await create_zip_archive(tracks, archive_name, progress)
 
+        progress.status = BatchStatus.SENDING
         size_mb = os.path.getsize(zip_path) / (1024 * 1024)
         caption = ZIP_COMPLETE.format(
-            filename=archive_name, count=len(tracks), size_mb=size_mb
+            filename=archive_name, count=len(tracks), size_mb=size_mb,
         )
 
         queue = _get_queue_manager(bot)
-        await queue.send_document(chat_id, zip_path, caption)
-        await status_msg.delete()
-    except Exception:
-        logger.exception("Failed to create/send ZIP archive")
-        await status_msg.edit_text(ERROR_TEXT, parse_mode="HTML")
+        await queue.send_document(chat_id, zip_path, caption, progress)
     finally:
         cleanup_files(track_paths)
         if zip_path:
             cleanup_file(zip_path)
 
 
-# ── .txt file handler ────────────────────────────────────────────────
+async def _run_batch_with_progress(
+    message: Message,
+    bot: Bot,
+    queries: list[str],
+    archive_label: str,
+    use_zip: bool,
+) -> None:
+    """Orchestrates a full batch download with a live progress message."""
+    progress = BatchProgress(total=len(queries))
+
+    # Send the initial progress message
+    if use_zip:
+        initial_text = ZIP_THRESHOLD_NOTICE + "\n\n" + BATCH_START
+    else:
+        initial_text = BATCH_START
+    status_msg = await message.answer(initial_text, parse_mode="HTML")
+
+    # Start the background progress-update loop
+    updater_task = asyncio.create_task(
+        _run_progress_updater(status_msg, progress)
+    )
+
+    try:
+        downloaded = await download_batch(queries, progress)
+
+        if not downloaded:
+            progress.status = BatchStatus.FAILED
+            progress.finished = True
+            await updater_task
+            await status_msg.edit_text(BATCH_ERROR, parse_mode="HTML")
+            return
+
+        if use_zip:
+            await _send_tracks_as_zip(
+                downloaded, message.chat.id, bot, archive_label, progress,
+            )
+        else:
+            await _send_tracks_individually(downloaded, message.chat.id, bot)
+
+        # Mark done, let the updater task exit, then show final message
+        progress.status = BatchStatus.DONE
+        progress.finished = True
+        await updater_task
+
+        final = progress.format_message()
+        try:
+            await status_msg.edit_text(final, parse_mode="HTML")
+        except Exception:
+            pass
+
+    except Exception:
+        logger.exception("Batch processing failed")
+        progress.status = BatchStatus.FAILED
+        progress.finished = True
+        await updater_task
+        try:
+            await status_msg.edit_text(BATCH_ERROR, parse_mode="HTML")
+        except Exception:
+            pass
+
+
+# ── .txt file handler ─────────────────────────────────────────────────
 
 @router.message(F.document)
 async def handle_txt_file(message: Message, bot: Bot) -> None:
@@ -131,51 +219,10 @@ async def handle_txt_file(message: Message, bot: Bot) -> None:
         return
 
     use_zip = len(lines) > ZIP_THRESHOLD
+    date_label = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
-    if use_zip:
-        await message.answer(ZIP_THRESHOLD_NOTICE, parse_mode="HTML")
-    else:
-        await message.answer(
-            TXT_PARSING.format(count=len(lines)), parse_mode="HTML"
-        )
-
-    downloaded: list[TrackInfo] = []
-    failed_lines: list[str] = []
-
-    for line in lines:
-        try:
-            track = await download_track(line)
-            downloaded.append(track)
-        except (DownloadError, ExtractorError) as exc:
-            logger.warning("yt-dlp error for '%s': %s", line, exc)
-            failed_lines.append(line)
-            if _is_drm_error(exc):
-                await message.answer(DRM_ERROR_TEXT, parse_mode="HTML")
-            else:
-                await message.answer(
-                    f"⚠️ Не удалось загрузить: <code>{line}</code>",
-                    parse_mode="HTML",
-                )
-        except Exception:
-            logger.exception("Unexpected error downloading: %s", line)
-            failed_lines.append(line)
-            await message.answer(
-                f"⚠️ Не удалось загрузить: <code>{line}</code>",
-                parse_mode="HTML",
-            )
-
-    if not downloaded:
-        return
-
-    if use_zip:
-        date_label = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        await _send_tracks_as_zip(downloaded, message.chat.id, bot, date_label, message)
-    else:
-        await _send_tracks_individually(downloaded, message.chat.id, bot)
-
-    await message.answer(
-        f"✅ Загружено: <b>{len(downloaded)}/{len(lines)}</b> треков",
-        parse_mode="HTML",
+    await _run_batch_with_progress(
+        message, bot, lines, date_label, use_zip,
     )
 
 
@@ -236,32 +283,57 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
 
         use_zip = track_count > ZIP_THRESHOLD
 
-        if use_zip:
-            await message.answer(
-                ALBUM_FOUND.format(title=album_title, count=track_count)
-                + "\n\n"
-                + ZIP_THRESHOLD_NOTICE,
-                parse_mode="HTML",
-            )
-        else:
-            await message.answer(
-                ALBUM_FOUND.format(title=album_title, count=track_count),
-                parse_mode="HTML",
-            )
-
-        tracks = await download_album(url)
-
-        if use_zip:
-            await _send_tracks_as_zip(
-                tracks, message.chat.id, bot, album_title, message
-            )
-        else:
-            await _send_tracks_individually(tracks, message.chat.id, bot)
-
         await message.answer(
-            ALBUM_COMPLETE.format(title=album_title, count=len(tracks)),
+            ALBUM_FOUND.format(title=album_title, count=track_count),
             parse_mode="HTML",
         )
+
+        progress = BatchProgress(total=track_count)
+
+        initial_text = BATCH_START
+        if use_zip:
+            initial_text = ZIP_THRESHOLD_NOTICE + "\n\n" + BATCH_START
+        status_msg = await message.answer(initial_text, parse_mode="HTML")
+
+        updater_task = asyncio.create_task(
+            _run_progress_updater(status_msg, progress)
+        )
+
+        try:
+            tracks = await download_album(url, progress)
+
+            if use_zip:
+                await _send_tracks_as_zip(
+                    tracks, message.chat.id, bot, album_title, progress,
+                )
+            else:
+                await _send_tracks_individually(tracks, message.chat.id, bot)
+
+            progress.status = BatchStatus.DONE
+            progress.finished = True
+            await updater_task
+
+            final = progress.format_message()
+            try:
+                await status_msg.edit_text(final, parse_mode="HTML")
+            except Exception:
+                pass
+
+            await message.answer(
+                ALBUM_COMPLETE.format(title=album_title, count=len(tracks)),
+                parse_mode="HTML",
+            )
+
+        except Exception:
+            logger.exception("Album download/processing failed: %s", url)
+            progress.status = BatchStatus.FAILED
+            progress.finished = True
+            await updater_task
+            try:
+                await status_msg.edit_text(BATCH_ERROR, parse_mode="HTML")
+            except Exception:
+                pass
+
     except (DownloadError, ExtractorError) as exc:
         logger.warning("yt-dlp album error for '%s': %s", url, exc)
         if _is_drm_error(exc):
