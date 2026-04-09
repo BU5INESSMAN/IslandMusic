@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 ZIP_THRESHOLD = 10
-PROGRESS_UPDATE_INTERVAL = 10  # seconds
+PROGRESS_DEBOUNCE = 2  # minimum seconds between Telegram edits
 
 _DRM_KEYWORDS = ("drm", "451", "geo", "unavailable for legal", "not available")
 _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -67,17 +67,29 @@ def _sanitize_filename(name: str) -> str:
     return _UNSAFE_FILENAME_RE.sub("_", name).strip("_ ")
 
 
-# ── Progress updater ──────────────────────────────────────────────────
+# ── Progress updater (event-driven with debounce) ────────────────────
 
 async def _run_progress_updater(
     status_msg: Message,
     progress: BatchProgress,
 ) -> None:
+    """Edit the Telegram message immediately when progress changes,
+    but no more often than every ``PROGRESS_DEBOUNCE`` seconds."""
+    changed = asyncio.Event()
+    progress.attach_event(changed)
+
     last_text = ""
     while not progress.finished:
-        await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+        # Wait for a change signal OR timeout (fallback poll)
+        try:
+            await asyncio.wait_for(changed.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            pass
+        changed.clear()
+
         if progress.finished:
             break
+
         new_text = progress.format_message()
         if new_text != last_text:
             try:
@@ -85,6 +97,8 @@ async def _run_progress_updater(
                 last_text = new_text
             except Exception:
                 logger.debug("Could not update progress message", exc_info=True)
+            # Debounce: prevent editing faster than Telegram allows
+            await asyncio.sleep(PROGRESS_DEBOUNCE)
 
 
 # ── DB logging helper ─────────────────────────────────────────────────

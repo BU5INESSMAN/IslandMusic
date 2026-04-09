@@ -25,7 +25,7 @@ DRM_ERROR_TEXT = (
     "Пожалуйста, напишите название трека текстом."
 )
 
-DOWNLOAD_COMPLETE = "✅ <b>{title}</b> — {artist}"
+DOWNLOAD_COMPLETE = "✅ {artist} - {title} [IslandMusic]"
 
 ALBUM_FOUND = "💿 Найден альбом: <b>{title}</b>\n📀 Треков: <b>{count}</b>\n\n⏳ Начинаю загрузку..."
 

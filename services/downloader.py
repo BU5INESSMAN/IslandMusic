@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 import aiohttp
 import yt_dlp
-from mutagen.id3 import COMM, ID3, TALB
+from mutagen.id3 import COMM, TALB, TIT2, TPE1
 from mutagen.mp3 import MP3
 
 from config import config
@@ -20,7 +20,7 @@ from services.progress import BatchProgress, BatchStatus
 logger = logging.getLogger(__name__)
 
 # ── Branding constants ────────────────────────────────────────────────
-BRAND_ALBUM = "IslandMusic (@island_music_bot)"
+BRAND_ALBUM = "IslandMusic Bot (@island_music_bot)"
 BRAND_COMMENT = "Downloaded via IslandMusic - your premium music assistant."
 
 _README_CONTENT = """\
@@ -34,6 +34,35 @@ Check out our other services:
 
 Enjoy your music!
 """.encode("utf-8")
+
+# ── Title-cleaning patterns ───────────────────────────────────────────
+# Suffixes commonly appended by YouTube uploaders
+_TITLE_JUNK_SUFFIXES = re.compile(
+    r"\s*[\(\[\|]?\s*"
+    r"(?:Official\s*(?:Audio|Video|Music\s*Video|Lyric\s*Video|Visualizer|MV)|"
+    r"Lyric(?:s)?\s*Video|High\s*Quality|HQ|HD|4K|Audio|"
+    r"(?:Official\s*)?Clip|Original\s*(?:Audio|Mix)|Remastered|"
+    r"Explicit|Clean\s*Version|Music\s*Video)"
+    r"\s*[\)\]]?\s*$",
+    re.IGNORECASE,
+)
+# Brackets with platform noise: [Official Audio], (HQ), etc.
+_BRACKET_JUNK = re.compile(
+    r"\s*[\(\[]\s*"
+    r"(?:Official(?:\s+\w+)?|Audio|Video|Lyrics?|HQ|HD|4K|"
+    r"Explicit|Remastered|Original(?:\s+\w+)?|Clean(?:\s+\w+)?)"
+    r"\s*[\)\]]",
+    re.IGNORECASE,
+)
+# Hyphen-like separators used in "Artist - Title"
+_ARTIST_TITLE_SEP = re.compile(r"\s+[-–—]\s+")
+
+# Platform junk in og:title scraping
+_TITLE_PLATFORM_JUNK = re.compile(
+    r"\s*[\-\|–—]\s*(?:Spotify|Яндекс[\s.]?Музыка|Yandex[\s.]?Music|"
+    r"Слушайте на|Listen on|Deezer).*$",
+    re.IGNORECASE,
+)
 
 URL_PATTERN = re.compile(
     r"https?://(?:www\.)?(?:youtube\.com|youtu\.be|music\.youtube\.com|"
@@ -51,12 +80,6 @@ _OG_TITLE_RE = re.compile(
 )
 _HTML_TITLE_RE = re.compile(r"<title[^>]*>([^<]+)</title>", re.IGNORECASE)
 
-_TITLE_JUNK = re.compile(
-    r"\s*[\-\|–—]\s*(?:Spotify|Яндекс[\s.]?Музыка|Yandex[\s.]?Music|"
-    r"Слушайте на|Listen on|Deezer).*$",
-    re.IGNORECASE,
-)
-
 _UNSAFE_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
 
 
@@ -67,7 +90,78 @@ class TrackInfo:
     artist: str
     album: str
     duration: int
+    source: str = ""
     thumbnail: str | None = None
+
+
+# ── Title / metadata cleaning ─────────────────────────────────────────
+
+def _clean_title(raw: str) -> str:
+    """Strip 'Official Audio', '(HQ)', '[Lyrics]', etc. from a title."""
+    cleaned = _BRACKET_JUNK.sub("", raw)
+    cleaned = _TITLE_JUNK_SUFFIXES.sub("", cleaned)
+    return cleaned.strip()
+
+
+def _smart_split_artist_title(
+    raw_title: str,
+    yt_artist: str | None,
+    yt_channel: str | None,
+) -> tuple[str, str]:
+    """Try to extract a clean Artist and Title.
+
+    Priority:
+    1. If the title contains "Artist - Title", split on the separator.
+    2. Else use yt-dlp's ``artist`` field (if present and not a generic
+       channel name).
+    3. Fall back to the channel/uploader, stripping " - Topic".
+    """
+    cleaned = _clean_title(raw_title)
+
+    # Try splitting "Artist - Title"
+    parts = _ARTIST_TITLE_SEP.split(cleaned, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip(), parts[1].strip()
+
+    # Use yt-dlp artist if it looks real
+    if yt_artist and yt_artist.lower() not in ("unknown", "unknown artist", ""):
+        artist = yt_artist
+        if artist.endswith(" - Topic"):
+            artist = artist[: -len(" - Topic")]
+        return artist.strip(), cleaned
+
+    # Fall back to channel
+    if yt_channel:
+        channel = yt_channel
+        if channel.endswith(" - Topic"):
+            channel = channel[: -len(" - Topic")]
+        return channel.strip(), cleaned
+
+    return "Unknown Artist", cleaned
+
+
+def _detect_source(info: dict) -> str:
+    """Return a human-readable source label from yt-dlp info."""
+    extractor = (info.get("extractor") or info.get("extractor_key") or "").lower()
+    url = info.get("webpage_url") or info.get("url") or ""
+
+    if "youtube" in extractor or "music.youtube" in url:
+        if "music.youtube" in url:
+            return "YouTube Music"
+        return "YouTube"
+    if "soundcloud" in extractor:
+        return "SoundCloud"
+    if "bandcamp" in extractor:
+        return "Bandcamp"
+    if "deezer" in extractor:
+        return "Deezer"
+    if "yandex" in extractor:
+        return "Yandex Music"
+    if "spotify" in extractor:
+        return "Spotify"
+    if extractor:
+        return extractor.capitalize()
+    return "Search"
 
 
 # ── URL helpers ───────────────────────────────────────────────────────
@@ -108,7 +202,7 @@ async def extract_metadata_from_url(url: str) -> str:
         raise ValueError(f"Could not extract title from {url}")
 
     raw_title = match.group(1).strip()
-    cleaned = _TITLE_JUNK.sub("", raw_title).strip()
+    cleaned = _TITLE_PLATFORM_JUNK.sub("", raw_title).strip()
     if not cleaned:
         raise ValueError(f"Empty title after cleanup from {url}")
 
@@ -172,22 +266,35 @@ def _find_downloaded_mp3(output_dir: str, prefix: str) -> list[str]:
 
 
 def _parse_track_info(info: dict, filepath: str) -> TrackInfo:
+    """Build a TrackInfo with cleaned artist/title and source detection."""
+    raw_title = info.get("title") or info.get("track") or "Unknown Title"
+    yt_artist = info.get("artist") or info.get("creator")
+    yt_channel = info.get("uploader") or info.get("channel")
+
+    artist, title = _smart_split_artist_title(raw_title, yt_artist, yt_channel)
+    source = _detect_source(info)
+
     return TrackInfo(
         filepath=filepath,
-        title=info.get("title") or info.get("track") or "Unknown Title",
-        artist=info.get("artist") or info.get("uploader") or info.get("channel") or "Unknown Artist",
-        album=info.get("album") or info.get("playlist_title") or "Single",
+        title=title,
+        artist=artist,
+        album=BRAND_ALBUM,
         duration=int(info.get("duration") or 0),
+        source=source,
         thumbnail=info.get("thumbnail"),
     )
 
 
-def _brand_metadata(filepath: str) -> None:
-    """Overwrite Album and Comment ID3 tags with IslandMusic branding."""
+def _brand_metadata(filepath: str, artist: str, title: str) -> None:
+    """Overwrite ID3 tags with cleaned metadata and IslandMusic branding."""
     try:
         audio = MP3(filepath)
         if audio.tags is None:
             audio.add_tags()
+        audio.tags.delall("TPE1")
+        audio.tags.add(TPE1(encoding=3, text=[artist]))
+        audio.tags.delall("TIT2")
+        audio.tags.add(TIT2(encoding=3, text=[title]))
         audio.tags.delall("TALB")
         audio.tags.add(TALB(encoding=3, text=[BRAND_ALBUM]))
         audio.tags.delall("COMM")
@@ -198,6 +305,23 @@ def _brand_metadata(filepath: str) -> None:
         logger.debug("Branded metadata: %s", filepath)
     except Exception:
         logger.warning("Failed to brand metadata for %s", filepath, exc_info=True)
+
+
+def _rename_track_file(filepath: str, artist: str, title: str) -> str:
+    """Rename downloaded file to 'Artist - Title.mp3'. Returns new path."""
+    directory = os.path.dirname(filepath)
+    ext = os.path.splitext(filepath)[1]
+    safe_name = _UNSAFE_CHARS_RE.sub("_", f"{artist} - {title}")
+    # Keep a short uuid prefix to avoid collisions
+    prefix = os.path.basename(filepath)[:8]
+    new_name = f"{prefix}_{safe_name}{ext}"
+    new_path = os.path.join(directory, new_name)
+    try:
+        os.rename(filepath, new_path)
+        return new_path
+    except OSError:
+        logger.warning("Could not rename %s -> %s", filepath, new_path)
+        return filepath
 
 
 # ── Single-track download ────────────────────────────────────────────
@@ -227,10 +351,12 @@ async def download_track(query: str) -> TrackInfo:
     if not files:
         raise FileNotFoundError(f"No MP3 file found after downloading: {query}")
 
-    _brand_metadata(files[0])
     track = _parse_track_info(info, files[0])
-    track.album = BRAND_ALBUM
-    logger.info("Finished download: '%s - %s'", track.artist, track.title)
+    _brand_metadata(files[0], track.artist, track.title)
+    new_path = _rename_track_file(files[0], track.artist, track.title)
+    track.filepath = new_path
+
+    logger.info("Finished download: '%s - %s' [%s]", track.artist, track.title, track.source)
     return track
 
 
@@ -240,14 +366,12 @@ async def download_batch(
     queries: list[str],
     progress: BatchProgress,
 ) -> list[TrackInfo]:
-    """Download a list of queries one-by-one, updating *progress* after each.
-
-    Failed tracks are logged and skipped — the process continues.
-    """
+    """Download a list of queries one-by-one, updating *progress* after each."""
     downloaded: list[TrackInfo] = []
 
     for i, query in enumerate(queries, 1):
         progress.current_track = query
+        progress.notify()
         logger.info(
             "Starting download for track [%d] of [%d]: '%s'",
             i, progress.total, query,
@@ -256,18 +380,23 @@ async def download_batch(
             track = await download_track(query)
             downloaded.append(track)
             progress.done += 1
+            progress.current_track = f"{track.artist} - {track.title}"
+            progress.source = track.source
+            progress.notify()
             logger.info(
-                "Finished downloading/converting track [%d]: '%s - %s'",
-                i, track.artist, track.title,
+                "Finished downloading/converting track [%d]: '%s - %s' [%s]",
+                i, track.artist, track.title, track.source,
             )
         except Exception as exc:
             progress.failed += 1
+            progress.notify()
             logger.error(
                 "Failed to download track [%d] of [%d] ('%s'): %s",
                 i, progress.total, query, exc,
             )
 
     progress.current_track = ""
+    progress.notify()
     return downloaded
 
 
@@ -299,17 +428,20 @@ async def download_album(
 
     tracks: list[TrackInfo] = []
     for i, filepath in enumerate(files):
-        _brand_metadata(filepath)
         entry_info = entries[i] if i < len(entries) else info
         track = _parse_track_info(entry_info, filepath)
-        track.album = BRAND_ALBUM
+        _brand_metadata(filepath, track.artist, track.title)
+        new_path = _rename_track_file(filepath, track.artist, track.title)
+        track.filepath = new_path
         tracks.append(track)
         if progress:
             progress.done += 1
             progress.current_track = f"{track.artist} - {track.title}"
+            progress.source = track.source
+            progress.notify()
             logger.info(
-                "Finished downloading/converting track [%d] of [%d]: '%s - %s'",
-                i + 1, progress.total, track.artist, track.title,
+                "Finished downloading/converting track [%d] of [%d]: '%s - %s' [%s]",
+                i + 1, progress.total, track.artist, track.title, track.source,
             )
 
     logger.info("Album download complete: %d tracks from %s", len(tracks), url)
@@ -346,13 +478,11 @@ def cleanup_files(filepaths: list[str]) -> None:
 
 # ── ZIP archiving (with multi-part support) ──────────────────────────
 
-# Telegram Bot API limit is 50 MB; we target 48 MB per part to be safe.
 TELEGRAM_FILE_LIMIT_BYTES: int = 50 * 1024 * 1024
-ZIP_PART_MAX_BYTES: int = 48 * 1024 * 1024
+ZIP_PART_MAX_BYTES: int = 49 * 1024 * 1024
 
 
 def get_tracks_total_size(tracks: list[TrackInfo]) -> int:
-    """Return the combined file size of all tracks in bytes."""
     total = 0
     for t in tracks:
         if os.path.exists(t.filepath):
@@ -370,11 +500,6 @@ def _partition_tracks_by_size(
     tracks: list[TrackInfo],
     max_bytes: int,
 ) -> list[list[TrackInfo]]:
-    """Split *tracks* into groups whose raw file sizes sum to ≤ *max_bytes*.
-
-    ZIP_DEFLATED adds negligible overhead for MP3 (already compressed),
-    so raw file size is a safe proxy for the archive size.
-    """
     parts: list[list[TrackInfo]] = []
     current_part: list[TrackInfo] = []
     current_size = 0
@@ -383,7 +508,6 @@ def _partition_tracks_by_size(
         if not os.path.exists(track.filepath):
             continue
         fsize = os.path.getsize(track.filepath)
-        # If a single track exceeds the limit it goes into its own part
         if current_part and current_size + fsize > max_bytes:
             parts.append(current_part)
             current_part = []
@@ -402,7 +526,6 @@ def _create_single_zip(
     archive_path: str,
     track_offset: int = 0,
 ) -> str:
-    """Create one ZIP file from *tracks*.  Returns the path."""
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for i, track in enumerate(tracks, track_offset + 1):
             if not os.path.exists(track.filepath):
@@ -420,16 +543,10 @@ def _create_zip_archives(
     base_name: str,
     progress: BatchProgress | None = None,
 ) -> list[str]:
-    """Create one or more ZIP archives for *tracks*.
-
-    If the total size fits within ``ZIP_PART_MAX_BYTES`` a single archive
-    is created.  Otherwise the tracks are split across numbered parts.
-
-    Returns the list of archive file paths.
-    """
     if progress:
         progress.status = BatchStatus.ARCHIVING
         progress.current_track = ""
+        progress.notify()
 
     total_size = get_tracks_total_size(tracks)
     total_mb = total_size / (1024 * 1024)
@@ -447,6 +564,7 @@ def _create_zip_archives(
         )
         if progress:
             progress.status = BatchStatus.SPLITTING
+            progress.notify()
 
     parts = _partition_tracks_by_size(tracks, ZIP_PART_MAX_BYTES)
 
@@ -465,6 +583,7 @@ def _create_zip_archives(
         if progress:
             progress.status = BatchStatus.ARCHIVING
             progress.current_track = f"Part {idx}/{len(parts)}"
+            progress.notify()
 
         _create_single_zip(part_tracks, archive_path, track_offset)
         archive_paths.append(archive_path)
@@ -485,10 +604,6 @@ async def create_zip_archives(
     base_name: str,
     progress: BatchProgress | None = None,
 ) -> list[str]:
-    """Compress *tracks* into one or more ZIPs in a thread pool.
-
-    Returns a list of archive paths (length 1 if no splitting needed).
-    """
     return await asyncio.to_thread(
         _create_zip_archives, tracks, base_name, progress,
     )
