@@ -16,6 +16,7 @@ from handlers.texts import (
     ALBUM_FOUND,
     BATCH_ERROR,
     BATCH_START,
+    CENSORED_ERROR_TEXT,
     DOWNLOAD_COMPLETE,
     DRM_ERROR_TEXT,
     ERROR_TEXT,
@@ -28,6 +29,7 @@ from handlers.texts import (
 )
 from services.downloader import (
     TELEGRAM_FILE_LIMIT_BYTES,
+    CensoredTrackError,
     TrackInfo,
     cleanup_file,
     cleanup_files,
@@ -345,6 +347,10 @@ async def handle_text(message: Message, bot: Bot) -> None:
         )
 
         await status_msg.delete()
+    except CensoredTrackError as exc:
+        logger.warning("Censored track for '%s': %s", text, exc)
+        await _log_failure(user_id, query=text, source_url=text if is_url(text) else None)
+        await status_msg.edit_text(CENSORED_ERROR_TEXT, parse_mode="HTML")
     except (DownloadError, ExtractorError) as exc:
         logger.warning("yt-dlp error for '%s': %s", text, exc)
         await _log_failure(user_id, query=text, source_url=text if is_url(text) else None)
@@ -427,6 +433,10 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
             except Exception:
                 pass
 
+    except CensoredTrackError as exc:
+        logger.warning("Censored album for '%s': %s", url, exc)
+        await _log_failure(user_id, query=url, source_url=url)
+        await message.answer(CENSORED_ERROR_TEXT, parse_mode="HTML")
     except (DownloadError, ExtractorError) as exc:
         logger.warning("yt-dlp album error for '%s': %s", url, exc)
         await _log_failure(user_id, query=url, source_url=url)

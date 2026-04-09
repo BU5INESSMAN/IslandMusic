@@ -19,6 +19,13 @@ from services.progress import BatchProgress, BatchStatus
 
 logger = logging.getLogger(__name__)
 
+# ── Censorship date cutoff ───────────────────────────────────────────
+CENSORSHIP_DATE = "20260301"
+
+
+class CensoredTrackError(Exception):
+    """Raised when a track was uploaded after the censorship cutoff date."""
+
 # ── Branding constants ────────────────────────────────────────────────
 BRAND_ALBUM = "IslandMusic Bot (@island_music_bot)"
 BRAND_COMMENT = "Downloaded via IslandMusic - your premium music assistant."
@@ -234,12 +241,13 @@ def _build_yt_dlp_opts(output_dir: str, filename_prefix: str) -> dict:
         "socket_timeout": 30,
         "retries": 3,
         "fragment_retries": 3,
+        "datebefore": CENSORSHIP_DATE,
     }
 
 
 def _build_search_opts(output_dir: str, filename_prefix: str) -> dict:
     opts = _build_yt_dlp_opts(output_dir, filename_prefix)
-    opts["default_search"] = "ytsearch1"
+    opts["default_search"] = "ytsearch10"
     return opts
 
 
@@ -258,6 +266,23 @@ def _extract_info(opts: dict, query: str) -> dict:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(query, download=True)
         return info or {}
+
+
+def _extract_info_no_download(query: str) -> dict:
+    """Fetch metadata only (no download) for date pre-checks."""
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(query, download=False)
+        return info or {}
+
+
+def _check_upload_date(info: dict) -> None:
+    """Raise CensoredTrackError if upload_date >= CENSORSHIP_DATE."""
+    upload_date = info.get("upload_date") or ""
+    if upload_date and upload_date >= CENSORSHIP_DATE:
+        raise CensoredTrackError(
+            f"Track uploaded on {upload_date}, after censorship cutoff {CENSORSHIP_DATE}"
+        )
 
 
 def _find_downloaded_mp3(output_dir: str, prefix: str) -> list[str]:
@@ -339,6 +364,10 @@ async def download_track(query: str) -> TrackInfo:
         opts = _build_search_opts(output_dir, prefix)
         search_query = f"{extracted} Official Audio"
     elif is_url(query):
+        # Direct link: pre-check upload date before downloading
+        logger.info("Direct URL — checking upload date: %s", query)
+        info_pre = await asyncio.to_thread(_extract_info_no_download, query)
+        _check_upload_date(info_pre)
         opts = _build_yt_dlp_opts(output_dir, prefix)
     else:
         opts = _build_search_opts(output_dir, prefix)
@@ -349,7 +378,9 @@ async def download_track(query: str) -> TrackInfo:
 
     files = _find_downloaded_mp3(output_dir, prefix)
     if not files:
-        raise FileNotFoundError(f"No MP3 file found after downloading: {query}")
+        raise CensoredTrackError(
+            f"No uncensored version found (uploaded before {CENSORSHIP_DATE}): {query}"
+        )
 
     track = _parse_track_info(info, files[0])
     _brand_metadata(files[0], track.artist, track.title)
