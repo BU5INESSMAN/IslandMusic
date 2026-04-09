@@ -304,41 +304,150 @@ def cleanup_files(filepaths: list[str]) -> None:
         cleanup_file(fp)
 
 
-# ── ZIP archiving (with progress) ────────────────────────────────────
+# ── ZIP archiving (with multi-part support) ──────────────────────────
 
-def _create_zip(
+# Telegram Bot API limit is 50 MB; we target 48 MB per part to be safe.
+TELEGRAM_FILE_LIMIT_BYTES: int = 50 * 1024 * 1024
+ZIP_PART_MAX_BYTES: int = 48 * 1024 * 1024
+
+
+def get_tracks_total_size(tracks: list[TrackInfo]) -> int:
+    """Return the combined file size of all tracks in bytes."""
+    total = 0
+    for t in tracks:
+        if os.path.exists(t.filepath):
+            total += os.path.getsize(t.filepath)
+    return total
+
+
+def _make_arc_name(index: int, track: TrackInfo) -> str:
+    ext = os.path.splitext(track.filepath)[1]
+    name = f"{index:02d} - {track.artist} - {track.title}{ext}"
+    return _UNSAFE_CHARS_RE.sub("_", name)
+
+
+def _partition_tracks_by_size(
     tracks: list[TrackInfo],
-    archive_name: str,
-    progress: BatchProgress | None = None,
-) -> str:
-    archive_path = os.path.join(config.downloads_dir, archive_name)
-    logger.info("Starting ZIP compression: %s (%d tracks)", archive_name, len(tracks))
+    max_bytes: int,
+) -> list[list[TrackInfo]]:
+    """Split *tracks* into groups whose raw file sizes sum to ≤ *max_bytes*.
 
+    ZIP_DEFLATED adds negligible overhead for MP3 (already compressed),
+    so raw file size is a safe proxy for the archive size.
+    """
+    parts: list[list[TrackInfo]] = []
+    current_part: list[TrackInfo] = []
+    current_size = 0
+
+    for track in tracks:
+        if not os.path.exists(track.filepath):
+            continue
+        fsize = os.path.getsize(track.filepath)
+        # If a single track exceeds the limit it goes into its own part
+        if current_part and current_size + fsize > max_bytes:
+            parts.append(current_part)
+            current_part = []
+            current_size = 0
+        current_part.append(track)
+        current_size += fsize
+
+    if current_part:
+        parts.append(current_part)
+
+    return parts
+
+
+def _create_single_zip(
+    tracks: list[TrackInfo],
+    archive_path: str,
+    track_offset: int = 0,
+) -> str:
+    """Create one ZIP file from *tracks*.  Returns the path."""
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, track in enumerate(tracks, track_offset + 1):
+            if not os.path.exists(track.filepath):
+                logger.warning("Skipping missing file: %s", track.filepath)
+                continue
+            zf.write(track.filepath, _make_arc_name(i, track))
+    size_mb = os.path.getsize(archive_path) / (1024 * 1024)
+    logger.info("Created ZIP: %s (%.1fMB, %d tracks)", archive_path, size_mb, len(tracks))
+    return archive_path
+
+
+def _create_zip_archives(
+    tracks: list[TrackInfo],
+    base_name: str,
+    progress: BatchProgress | None = None,
+) -> list[str]:
+    """Create one or more ZIP archives for *tracks*.
+
+    If the total size fits within ``ZIP_PART_MAX_BYTES`` a single archive
+    is created.  Otherwise the tracks are split across numbered parts.
+
+    Returns the list of archive file paths.
+    """
     if progress:
         progress.status = BatchStatus.ARCHIVING
         progress.current_track = ""
 
-    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for i, track in enumerate(tracks, 1):
-            if not os.path.exists(track.filepath):
-                logger.warning("Skipping missing file: %s", track.filepath)
-                continue
-            ext = os.path.splitext(track.filepath)[1]
-            arc_name = f"{i:02d} - {track.artist} - {track.title}{ext}"
-            arc_name = _UNSAFE_CHARS_RE.sub("_", arc_name)
-            zf.write(track.filepath, arc_name)
-
-    size_mb = os.path.getsize(archive_path) / (1024 * 1024)
+    total_size = get_tracks_total_size(tracks)
+    total_mb = total_size / (1024 * 1024)
     logger.info(
-        "Finished ZIP compression. File size: %.1fMB (%s)",
-        size_mb, archive_path,
+        "Starting ZIP compression: %s (%d tracks, %.1fMB raw)",
+        base_name, len(tracks), total_mb,
     )
-    return archive_path
+
+    needs_split = total_size > ZIP_PART_MAX_BYTES
+
+    if needs_split:
+        logger.info(
+            "Total size %.1fMB exceeds %dMB limit — splitting into parts",
+            total_mb, ZIP_PART_MAX_BYTES // (1024 * 1024),
+        )
+        if progress:
+            progress.status = BatchStatus.SPLITTING
+
+    parts = _partition_tracks_by_size(tracks, ZIP_PART_MAX_BYTES)
+
+    archive_paths: list[str] = []
+    stem = base_name.removesuffix(".zip")
+    track_offset = 0
+
+    for idx, part_tracks in enumerate(parts, 1):
+        if len(parts) == 1:
+            filename = base_name
+        else:
+            filename = f"{stem}_Part{idx}.zip"
+
+        archive_path = os.path.join(config.downloads_dir, filename)
+
+        if progress:
+            progress.status = BatchStatus.ARCHIVING
+            progress.current_track = f"Part {idx}/{len(parts)}"
+
+        _create_single_zip(part_tracks, archive_path, track_offset)
+        archive_paths.append(archive_path)
+        track_offset += len(part_tracks)
+
+    total_archive_mb = sum(
+        os.path.getsize(p) / (1024 * 1024) for p in archive_paths
+    )
+    logger.info(
+        "Finished ZIP compression. %d archive(s), total %.1fMB",
+        len(archive_paths), total_archive_mb,
+    )
+    return archive_paths
 
 
-async def create_zip_archive(
+async def create_zip_archives(
     tracks: list[TrackInfo],
-    archive_name: str,
+    base_name: str,
     progress: BatchProgress | None = None,
-) -> str:
-    return await asyncio.to_thread(_create_zip, tracks, archive_name, progress)
+) -> list[str]:
+    """Compress *tracks* into one or more ZIPs in a thread pool.
+
+    Returns a list of archive paths (length 1 if no splitting needed).
+    """
+    return await asyncio.to_thread(
+        _create_zip_archives, tracks, base_name, progress,
+    )

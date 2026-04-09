@@ -19,15 +19,19 @@ from handlers.texts import (
     DOWNLOAD_COMPLETE,
     DRM_ERROR_TEXT,
     ERROR_TEXT,
+    FILE_TOO_LARGE,
     WAIT_TEXT,
     ZIP_COMPLETE,
+    ZIP_PART_SENT,
+    ZIP_SPLITTING,
     ZIP_THRESHOLD_NOTICE,
 )
 from services.downloader import (
+    TELEGRAM_FILE_LIMIT_BYTES,
     TrackInfo,
     cleanup_file,
     cleanup_files,
-    create_zip_archive,
+    create_zip_archives,
     download_album,
     download_batch,
     download_track,
@@ -35,7 +39,7 @@ from services.downloader import (
     is_url,
 )
 from services.progress import BatchProgress, BatchStatus
-from services.queue_manager import QueueItem, QueueManager
+from services.queue_manager import FileTooLargeError, QueueItem, QueueManager
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -139,28 +143,50 @@ async def _send_tracks_as_zip(
     bot: Bot,
     archive_label: str,
     progress: BatchProgress,
+    message: Message | None = None,
 ) -> None:
+    """Archive tracks into one or more ZIPs and send each via Telegram."""
     safe_label = _sanitize_filename(archive_label) or "batch"
     archive_name = f"IslandMusic_{safe_label}.zip"
 
     track_paths = [t.filepath for t in tracks]
-    zip_path: str | None = None
+    zip_paths: list[str] = []
 
     try:
-        zip_path = await create_zip_archive(tracks, archive_name, progress)
+        zip_paths = await create_zip_archives(tracks, archive_name, progress)
+
+        if len(zip_paths) > 1 and message:
+            await message.answer(ZIP_SPLITTING, parse_mode="HTML")
 
         progress.status = BatchStatus.SENDING
-        size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-        caption = ZIP_COMPLETE.format(
-            filename=archive_name, count=len(tracks), size_mb=size_mb,
-        )
-
         queue = _get_queue_manager(bot)
-        await queue.send_document(chat_id, zip_path, caption, progress)
+
+        for part_idx, zpath in enumerate(zip_paths, 1):
+            size_mb = os.path.getsize(zpath) / (1024 * 1024)
+            fname = os.path.basename(zpath)
+
+            if len(zip_paths) == 1:
+                caption = ZIP_COMPLETE.format(
+                    filename=fname, count=len(tracks), size_mb=size_mb,
+                )
+            else:
+                caption = ZIP_PART_SENT.format(
+                    part=part_idx, total_parts=len(zip_paths), size_mb=size_mb,
+                )
+
+            try:
+                await queue.send_document(chat_id, zpath, caption, progress)
+            except FileTooLargeError:
+                limit_mb = TELEGRAM_FILE_LIMIT_BYTES // (1024 * 1024)
+                if message:
+                    await message.answer(
+                        FILE_TOO_LARGE.format(limit_mb=limit_mb),
+                        parse_mode="HTML",
+                    )
+                return
     finally:
         cleanup_files(track_paths)
-        if zip_path:
-            cleanup_file(zip_path)
+        cleanup_files(zip_paths)
 
 
 async def _run_batch_with_progress(
@@ -205,6 +231,7 @@ async def _run_batch_with_progress(
         if use_zip:
             await _send_tracks_as_zip(
                 downloaded, message.chat.id, bot, archive_label, progress,
+                message=message,
             )
         else:
             await _send_tracks_individually(downloaded, message.chat.id, bot)
@@ -355,6 +382,7 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
             if use_zip:
                 await _send_tracks_as_zip(
                     tracks, message.chat.id, bot, album_title, progress,
+                    message=message,
                 )
             else:
                 await _send_tracks_individually(tracks, message.chat.id, bot)

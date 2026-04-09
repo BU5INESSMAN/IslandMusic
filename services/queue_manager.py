@@ -10,10 +10,13 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import FSInputFile
 
 from config import config
-from services.downloader import TrackInfo, cleanup_file
+from services.downloader import TELEGRAM_FILE_LIMIT_BYTES, TrackInfo, cleanup_file
 from services.progress import BatchProgress, BatchStatus
 
 logger = logging.getLogger(__name__)
+
+# Timeout for large file uploads (5 minutes).
+UPLOAD_TIMEOUT = 300
 
 
 @dataclass
@@ -21,6 +24,10 @@ class QueueItem:
     chat_id: int
     track: TrackInfo
     caption: str
+
+
+class FileTooLargeError(Exception):
+    """Raised when a file exceeds Telegram's upload limit."""
 
 
 class QueueManager:
@@ -73,13 +80,25 @@ class QueueManager:
             logger.error("Document not found: %s", filepath)
             return
 
+        file_size = os.path.getsize(filepath)
+        size_mb = file_size / (1024 * 1024)
+
+        if file_size > TELEGRAM_FILE_LIMIT_BYTES:
+            logger.error(
+                "File too large for Telegram Bot API: %s (%.1fMB > %dMB limit)",
+                filepath, size_mb, TELEGRAM_FILE_LIMIT_BYTES // (1024 * 1024),
+            )
+            raise FileTooLargeError(
+                f"File {filepath} is {size_mb:.1f}MB, exceeds "
+                f"{TELEGRAM_FILE_LIMIT_BYTES // (1024 * 1024)}MB Telegram limit"
+            )
+
         if progress:
             progress.status = BatchStatus.SENDING
 
-        size_mb = os.path.getsize(filepath) / (1024 * 1024)
         logger.info(
-            "Starting document upload to chat %d: %s (%.1fMB)",
-            chat_id, filepath, size_mb,
+            "Starting document upload to chat %d: %s (%.1fMB, timeout=%ds)",
+            chat_id, filepath, size_mb, UPLOAD_TIMEOUT,
         )
 
         doc_file = FSInputFile(filepath)
@@ -91,14 +110,17 @@ class QueueManager:
                     document=doc_file,
                     caption=caption,
                     parse_mode="HTML",
+                    request_timeout=UPLOAD_TIMEOUT,
                 )
                 logger.info(
-                    "Successfully sent document '%s' to chat %d", filepath, chat_id
+                    "Successfully sent document '%s' (%.1fMB) to chat %d",
+                    filepath, size_mb, chat_id,
                 )
                 return
             except TelegramRetryAfter as e:
                 logger.warning(
-                    "Rate limited on document send, retrying after %ds", e.retry_after
+                    "Rate limited on document send, retrying after %ds",
+                    e.retry_after,
                 )
                 await asyncio.sleep(e.retry_after)
             except Exception:
@@ -130,6 +152,7 @@ class QueueManager:
                     duration=item.track.duration,
                     caption=item.caption,
                     parse_mode="HTML",
+                    request_timeout=UPLOAD_TIMEOUT,
                 )
                 logger.info(
                     "Successfully sent '%s' to chat %d",

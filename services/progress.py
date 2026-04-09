@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 class BatchStatus(enum.Enum):
     DOWNLOADING = "Скачивание"
     ARCHIVING = "Архивирование"
+    SPLITTING = "Разбиваю на части"
     SENDING = "Отправка"
     DONE = "Готово"
     FAILED = "Ошибка"
@@ -53,6 +54,7 @@ class BatchProgress:
         status_emoji = {
             BatchStatus.DOWNLOADING: "💿",
             BatchStatus.ARCHIVING: "🗜",
+            BatchStatus.SPLITTING: "✂️",
             BatchStatus.SENDING: "📤",
             BatchStatus.DONE: "✅",
             BatchStatus.FAILED: "❌",
