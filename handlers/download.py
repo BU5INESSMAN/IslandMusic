@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import os
 import re
@@ -27,6 +28,7 @@ from handlers.texts import (
     ZIP_SPLITTING,
     ZIP_THRESHOLD_NOTICE,
 )
+from services.admin import notify_admins
 from services.downloader import (
     TELEGRAM_FILE_LIMIT_BYTES,
     CensoredTrackError,
@@ -50,6 +52,11 @@ ZIP_THRESHOLD = 10
 PROGRESS_DEBOUNCE = 2  # minimum seconds between Telegram edits
 
 _DRM_KEYWORDS = ("drm", "451", "geo", "unavailable for legal", "not available")
+_COOKIE_ALERT_KEYWORDS = (
+    "sign in to confirm your age",
+    "cookies",
+    "private video",
+)
 _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -67,6 +74,30 @@ def _get_queue_manager(bot: Bot) -> QueueManager:
 
 def _sanitize_filename(name: str) -> str:
     return _UNSAFE_FILENAME_RE.sub("_", name).strip("_ ")
+
+
+def _schedule_admin_notification(bot: Bot, text: str) -> None:
+    asyncio.create_task(notify_admins(bot, text))
+
+
+def _schedule_error_notifications(bot: Bot, user_id: int, error_msg: str) -> None:
+    safe_error = html.escape(error_msg)
+    _schedule_admin_notification(
+        bot,
+        (
+            "⚠️ <b>Ошибка загрузки:</b> "
+            f"У пользователя {user_id} не скачался трек.\nОшибка: {safe_error}"
+        ),
+    )
+    if any(keyword in error_msg.lower() for keyword in _COOKIE_ALERT_KEYWORDS):
+        _schedule_admin_notification(
+            bot,
+            (
+                "🚨 <b>КРИТИЧЕСКИЙ АЛЕРТ:</b> Скорее всего, файл cookies.txt "
+                "просрочен! YouTube требует авторизацию (18+). "
+                "Пожалуйста, обновите куки на сервере."
+            ),
+        )
 
 
 # ── Progress updater (event-driven with debounce) ────────────────────
@@ -227,15 +258,19 @@ async def _run_batch_with_progress(
     )
 
     try:
-        downloaded = await download_batch(queries, progress)
+        async def _on_track_error(failed_query: str, exc: Exception) -> None:
+            await _log_failure(
+                user_id,
+                query=failed_query,
+                source_url=failed_query if is_url(failed_query) else None,
+            )
+            _schedule_error_notifications(bot, user_id, str(exc))
+
+        downloaded = await download_batch(queries, progress, on_error=_on_track_error)
 
         # Log results to DB
         if downloaded:
             await _log_tracks(user_id, downloaded, query="txt_batch")
-        for q in queries:
-            if q not in [t.title for t in downloaded]:
-                # Approximate: log failed queries
-                pass
 
         if not downloaded:
             progress.status = BatchStatus.FAILED
@@ -297,6 +332,13 @@ async def handle_txt_file(message: Message, bot: Bot) -> None:
 
     use_zip = len(lines) > ZIP_THRESHOLD
     date_label = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    _schedule_admin_notification(
+        bot,
+        (
+            "📥 <b>Скачивание:</b> "
+            f"Пользователь {message.from_user.id} запустил загрузку {len(lines)} треков."
+        ),
+    )
 
     await _run_batch_with_progress(
         message, bot, lines, date_label, use_zip,
@@ -350,17 +392,20 @@ async def handle_text(message: Message, bot: Bot) -> None:
     except CensoredTrackError as exc:
         logger.warning("Censored track for '%s': %s", text, exc)
         await _log_failure(user_id, query=text, source_url=text if is_url(text) else None)
+        _schedule_error_notifications(bot, user_id, str(exc))
         await status_msg.edit_text(CENSORED_ERROR_TEXT, parse_mode="HTML")
     except (DownloadError, ExtractorError) as exc:
         logger.warning("yt-dlp error for '%s': %s", text, exc)
         await _log_failure(user_id, query=text, source_url=text if is_url(text) else None)
+        _schedule_error_notifications(bot, user_id, str(exc))
         if _is_drm_error(exc):
             await status_msg.edit_text(DRM_ERROR_TEXT, parse_mode="HTML")
         else:
             await status_msg.edit_text(ERROR_TEXT, parse_mode="HTML")
-    except Exception:
+    except Exception as exc:
         logger.exception("Download failed for query: %s", text)
         await _log_failure(user_id, query=text)
+        _schedule_error_notifications(bot, user_id, str(exc))
         await status_msg.edit_text(ERROR_TEXT, parse_mode="HTML")
 
 
@@ -376,6 +421,14 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
         track_count = len(list(entries))
 
         use_zip = track_count > ZIP_THRESHOLD
+
+        _schedule_admin_notification(
+            bot,
+            (
+                "📥 <b>Скачивание:</b> "
+                f"Пользователь {user_id} запустил загрузку {track_count} треков."
+            ),
+        )
 
         await message.answer(
             ALBUM_FOUND.format(title=album_title, count=track_count),
@@ -422,9 +475,10 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
                 parse_mode="HTML",
             )
 
-        except Exception:
+        except Exception as exc:
             logger.exception("Album download/processing failed: %s", url)
             await _log_failure(user_id, query=album_title, source_url=url)
+            _schedule_error_notifications(bot, user_id, str(exc))
             progress.status = BatchStatus.FAILED
             progress.finished = True
             await updater_task
@@ -436,14 +490,17 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
     except CensoredTrackError as exc:
         logger.warning("Censored album for '%s': %s", url, exc)
         await _log_failure(user_id, query=url, source_url=url)
+        _schedule_error_notifications(bot, user_id, str(exc))
         await message.answer(CENSORED_ERROR_TEXT, parse_mode="HTML")
     except (DownloadError, ExtractorError) as exc:
         logger.warning("yt-dlp album error for '%s': %s", url, exc)
         await _log_failure(user_id, query=url, source_url=url)
+        _schedule_error_notifications(bot, user_id, str(exc))
         if _is_drm_error(exc):
             await message.answer(DRM_ERROR_TEXT, parse_mode="HTML")
         else:
             await message.answer(ERROR_TEXT, parse_mode="HTML")
-    except Exception:
+    except Exception as exc:
         logger.exception("Album download failed: %s", url)
+        _schedule_error_notifications(bot, user_id, str(exc))
         await message.answer(ERROR_TEXT, parse_mode="HTML")

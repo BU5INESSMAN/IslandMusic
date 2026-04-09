@@ -33,6 +33,8 @@ class BatchProgress:
     source: str = ""
     started_at: float = field(default_factory=time.monotonic)
     finished: bool = False
+    ema_track_seconds: float | None = None
+    current_item_started_at: float | None = None
     # Set by the handler after creation — allows event-driven UI updates.
     _changed: asyncio.Event | None = field(default=None, repr=False)
 
@@ -47,12 +49,27 @@ class BatchProgress:
     def elapsed_seconds(self) -> float:
         return time.monotonic() - self.started_at
 
+    def start_item(self) -> None:
+        self.current_item_started_at = time.monotonic()
+
+    def finish_item(self) -> None:
+        if self.current_item_started_at is None:
+            return
+        duration = max(time.monotonic() - self.current_item_started_at, 0.0)
+        alpha = 0.35
+        if self.ema_track_seconds is None:
+            self.ema_track_seconds = duration
+        else:
+            self.ema_track_seconds = (
+                alpha * duration + (1 - alpha) * self.ema_track_seconds
+            )
+        self.current_item_started_at = None
+
     def eta_seconds(self) -> float:
-        if self.done == 0:
+        if self.ema_track_seconds is None:
             return 0.0
-        avg = self.elapsed_seconds() / self.done
         remaining = self.total - self.done - self.failed
-        return max(avg * remaining, 0.0)
+        return max(self.ema_track_seconds * remaining, 0.0)
 
     def format_time(self, seconds: float) -> str:
         m, s = divmod(int(seconds), 60)

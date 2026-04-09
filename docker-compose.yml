@@ -8,6 +8,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./downloads:/app/downloads
+      - ./cookies.txt:/app/cookies.txt:ro
     logging:
       driver: json-file
       options:

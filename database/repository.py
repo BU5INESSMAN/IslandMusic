@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.engine import async_session
-from database.models import DownloadHistory
+from database.models import DownloadHistory, User
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,37 @@ async def log_download(
             await session.commit()
     except Exception:
         logger.exception("Failed to log download for user %d", user_id)
+
+
+async def register_user(
+    user_id: int,
+    username: str | None,
+    full_name: str | None,
+) -> bool:
+    """Create or update a user record. Returns True if the user is new."""
+    try:
+        async with async_session() as session:
+            existing = await session.get(User, user_id)
+            if existing is None:
+                session.add(
+                    User(user_id=user_id, username=username, full_name=full_name)
+                )
+                await session.commit()
+                return True
+
+            changed = False
+            if existing.username != username:
+                existing.username = username
+                changed = True
+            if existing.full_name != full_name:
+                existing.full_name = full_name
+                changed = True
+            if changed:
+                await session.commit()
+            return False
+    except Exception:
+        logger.exception("Failed to register user %d", user_id)
+        return False
 
 
 async def get_user_history(

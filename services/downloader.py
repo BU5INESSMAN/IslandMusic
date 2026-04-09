@@ -7,6 +7,7 @@ import os
 import re
 import uuid
 import zipfile
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import aiohttp
@@ -238,9 +239,14 @@ def _build_yt_dlp_opts(output_dir: str, filename_prefix: str) -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "socket_timeout": 30,
+        "socket_timeout": 15,
         "retries": 3,
         "fragment_retries": 3,
+        "ignoreerrors": True,
+        "cookiefile": "cookies.txt",
+        "extractor_args": {
+            "youtube": ["player_client=android", "player_skip=webpage"],
+        },
         "datebefore": CENSORSHIP_DATE,
     }
 
@@ -270,7 +276,16 @@ def _extract_info(opts: dict, query: str) -> dict:
 
 def _extract_info_no_download(query: str) -> dict:
     """Fetch metadata only (no download) for date pre-checks."""
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 15,
+        "cookiefile": "cookies.txt",
+        "extractor_args": {
+            "youtube": ["player_client=android", "player_skip=webpage"],
+        },
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(query, download=False)
         return info or {}
@@ -396,12 +411,14 @@ async def download_track(query: str) -> TrackInfo:
 async def download_batch(
     queries: list[str],
     progress: BatchProgress,
+    on_error: Callable[[str, Exception], Awaitable[None]] | None = None,
 ) -> list[TrackInfo]:
     """Download a list of queries one-by-one, updating *progress* after each."""
     downloaded: list[TrackInfo] = []
 
     for i, query in enumerate(queries, 1):
         progress.current_track = query
+        progress.start_item()
         progress.notify()
         logger.info(
             "Starting download for track [%d] of [%d]: '%s'",
@@ -411,6 +428,7 @@ async def download_batch(
             track = await download_track(query)
             downloaded.append(track)
             progress.done += 1
+            progress.finish_item()
             progress.current_track = f"{track.artist} - {track.title}"
             progress.source = track.source
             progress.notify()
@@ -420,11 +438,14 @@ async def download_batch(
             )
         except Exception as exc:
             progress.failed += 1
+            progress.finish_item()
             progress.notify()
             logger.error(
                 "Failed to download track [%d] of [%d] ('%s'): %s",
                 i, progress.total, query, exc,
             )
+            if on_error is not None:
+                await on_error(query, exc)
 
     progress.current_track = ""
     progress.notify()
@@ -451,7 +472,7 @@ async def download_album(
 
     logger.info("Starting album download: %s", url)
     info = await asyncio.to_thread(_extract_info, opts, url)
-    entries = info.get("entries") or []
+    entries = [entry for entry in (info.get("entries") or []) if entry]
 
     files = _find_downloaded_mp3(output_dir, prefix)
     if not files:
@@ -460,6 +481,8 @@ async def download_album(
     tracks: list[TrackInfo] = []
     for i, filepath in enumerate(files):
         entry_info = entries[i] if i < len(entries) else info
+        if progress:
+            progress.start_item()
         track = _parse_track_info(entry_info, filepath)
         _brand_metadata(filepath, track.artist, track.title)
         new_path = _rename_track_file(filepath, track.artist, track.title)
@@ -467,6 +490,7 @@ async def download_album(
         tracks.append(track)
         if progress:
             progress.done += 1
+            progress.finish_item()
             progress.current_track = f"{track.artist} - {track.title}"
             progress.source = track.source
             progress.notify()
@@ -485,6 +509,11 @@ async def get_album_info(url: str) -> dict:
         "no_warnings": True,
         "extract_flat": True,
         "noplaylist": False,
+        "socket_timeout": 15,
+        "cookiefile": "cookies.txt",
+        "extractor_args": {
+            "youtube": ["player_client=android", "player_skip=webpage"],
+        },
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = await asyncio.to_thread(ydl.extract_info, url, download=False)
