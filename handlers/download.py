@@ -1,16 +1,16 @@
-import io
 import logging
-import os
-import tempfile
 
 from aiogram import Bot, F, Router
 from aiogram.types import Message
+from yt_dlp.utils import DownloadError, ExtractorError
 
 from handlers.texts import (
     ALBUM_COMPLETE,
     ALBUM_FOUND,
     DOWNLOAD_COMPLETE,
+    DRM_ERROR_TEXT,
     ERROR_TEXT,
+    FALLBACK_SEARCH_TEXT,
     TXT_PARSING,
     WAIT_TEXT,
 )
@@ -25,6 +25,14 @@ from services.queue_manager import QueueItem, QueueManager
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+_DRM_KEYWORDS = ("drm", "451", "geo", "unavailable for legal", "not available")
+
+
+def _is_drm_error(exc: Exception) -> bool:
+    """Check if a yt-dlp exception is DRM / geo-block related."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _DRM_KEYWORDS)
 
 
 def _get_queue_manager(bot: Bot) -> QueueManager:
@@ -69,10 +77,20 @@ async def handle_txt_file(message: Message, bot: Bot) -> None:
                 QueueItem(chat_id=message.chat.id, track=track, caption=caption)
             )
             success_count += 1
+        except (DownloadError, ExtractorError) as exc:
+            logger.warning("yt-dlp error for '%s': %s", line, exc)
+            if _is_drm_error(exc):
+                await message.answer(DRM_ERROR_TEXT, parse_mode="HTML")
+            else:
+                await message.answer(
+                    f"⚠️ Не удалось загрузить: <code>{line}</code>",
+                    parse_mode="HTML",
+                )
         except Exception:
-            logger.exception("Failed to download from txt: %s", line)
+            logger.exception("Unexpected error downloading from txt: %s", line)
             await message.answer(
-                f"⚠️ Не удалось загрузить: <code>{line}</code>", parse_mode="HTML"
+                f"⚠️ Не удалось загрузить: <code>{line}</code>",
+                parse_mode="HTML",
             )
 
     if success_count > 0:
@@ -115,6 +133,12 @@ async def handle_text(message: Message, bot: Bot) -> None:
         )
 
         await status_msg.delete()
+    except (DownloadError, ExtractorError) as exc:
+        logger.warning("yt-dlp error for '%s': %s", text, exc)
+        if _is_drm_error(exc):
+            await status_msg.edit_text(DRM_ERROR_TEXT, parse_mode="HTML")
+        else:
+            await status_msg.edit_text(ERROR_TEXT, parse_mode="HTML")
     except Exception:
         logger.exception("Download failed for query: %s", text)
         await status_msg.edit_text(ERROR_TEXT, parse_mode="HTML")
@@ -146,6 +170,12 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
             ALBUM_COMPLETE.format(title=album_title, count=len(tracks)),
             parse_mode="HTML",
         )
+    except (DownloadError, ExtractorError) as exc:
+        logger.warning("yt-dlp album error for '%s': %s", url, exc)
+        if _is_drm_error(exc):
+            await message.answer(DRM_ERROR_TEXT, parse_mode="HTML")
+        else:
+            await message.answer(ERROR_TEXT, parse_mode="HTML")
     except Exception:
         logger.exception("Album download failed: %s", url)
         await message.answer(ERROR_TEXT, parse_mode="HTML")
