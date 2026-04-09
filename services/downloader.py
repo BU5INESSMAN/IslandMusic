@@ -11,11 +11,29 @@ from dataclasses import dataclass
 
 import aiohttp
 import yt_dlp
+from mutagen.id3 import COMM, ID3, TALB
+from mutagen.mp3 import MP3
 
 from config import config
 from services.progress import BatchProgress, BatchStatus
 
 logger = logging.getLogger(__name__)
+
+# ── Branding constants ────────────────────────────────────────────────
+BRAND_ALBUM = "IslandMusic (@island_music_bot)"
+BRAND_COMMENT = "Downloaded via IslandMusic - your premium music assistant."
+
+_README_CONTENT = """\
+=== IslandMusic ===
+
+Thank you for using IslandMusic Bot (@island_music_bot)!
+
+Check out our other services:
+  - IslandVPN  — fast, private, no-log VPN: @island_vpn_bot
+  - IslandCloud — secure file hosting: @island_cloud_bot
+
+Enjoy your music!
+""".encode("utf-8")
 
 URL_PATTERN = re.compile(
     r"https?://(?:www\.)?(?:youtube\.com|youtu\.be|music\.youtube\.com|"
@@ -164,6 +182,24 @@ def _parse_track_info(info: dict, filepath: str) -> TrackInfo:
     )
 
 
+def _brand_metadata(filepath: str) -> None:
+    """Overwrite Album and Comment ID3 tags with IslandMusic branding."""
+    try:
+        audio = MP3(filepath)
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags.delall("TALB")
+        audio.tags.add(TALB(encoding=3, text=[BRAND_ALBUM]))
+        audio.tags.delall("COMM")
+        audio.tags.add(
+            COMM(encoding=3, lang="eng", desc="", text=[BRAND_COMMENT])
+        )
+        audio.save()
+        logger.debug("Branded metadata: %s", filepath)
+    except Exception:
+        logger.warning("Failed to brand metadata for %s", filepath, exc_info=True)
+
+
 # ── Single-track download ────────────────────────────────────────────
 
 async def download_track(query: str) -> TrackInfo:
@@ -191,7 +227,9 @@ async def download_track(query: str) -> TrackInfo:
     if not files:
         raise FileNotFoundError(f"No MP3 file found after downloading: {query}")
 
+    _brand_metadata(files[0])
     track = _parse_track_info(info, files[0])
+    track.album = BRAND_ALBUM
     logger.info("Finished download: '%s - %s'", track.artist, track.title)
     return track
 
@@ -261,8 +299,10 @@ async def download_album(
 
     tracks: list[TrackInfo] = []
     for i, filepath in enumerate(files):
+        _brand_metadata(filepath)
         entry_info = entries[i] if i < len(entries) else info
         track = _parse_track_info(entry_info, filepath)
+        track.album = BRAND_ALBUM
         tracks.append(track)
         if progress:
             progress.done += 1
@@ -369,6 +409,7 @@ def _create_single_zip(
                 logger.warning("Skipping missing file: %s", track.filepath)
                 continue
             zf.write(track.filepath, _make_arc_name(i, track))
+        zf.writestr("README.txt", _README_CONTENT)
     size_mb = os.path.getsize(archive_path) / (1024 * 1024)
     logger.info("Created ZIP: %s (%.1fMB, %d tracks)", archive_path, size_mb, len(tracks))
     return archive_path
