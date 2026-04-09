@@ -36,3 +36,11 @@ ALBUM_FOUND = "💿 Найден альбом: <b>{title}</b>\n📀 Треков
 ALBUM_COMPLETE = "✅ Альбом <b>{title}</b> загружен! ({count} треков)"
 
 TXT_PARSING = "📋 Найдено <b>{count}</b> треков в файле. Начинаю загрузку..."
+
+ZIP_THRESHOLD_NOTICE = (
+    "📦 В списке больше 10 треков. Чтобы не спамить, я соберу их в один архив..."
+)
+
+ZIP_CREATING = "🗜 <i>Создаю ZIP-архив...</i>"
+
+ZIP_COMPLETE = "✅ Архив <b>{filename}</b> готов! ({count} треков, {size_mb:.1f} МБ)"

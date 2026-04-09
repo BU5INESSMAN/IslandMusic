@@ -245,3 +245,34 @@ def cleanup_file(filepath: str) -> None:
             logger.info("Cleaned up: %s", filepath)
     except OSError as e:
         logger.warning("Failed to clean up %s: %s", filepath, e)
+
+
+def cleanup_files(filepaths: list[str]) -> None:
+    for fp in filepaths:
+        cleanup_file(fp)
+
+
+def _create_zip(tracks: list[TrackInfo], archive_name: str) -> str:
+    """Synchronous ZIP creation — call via asyncio.to_thread()."""
+    import zipfile
+
+    archive_path = os.path.join(config.downloads_dir, archive_name)
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, track in enumerate(tracks, 1):
+            if not os.path.exists(track.filepath):
+                logger.warning("Skipping missing file: %s", track.filepath)
+                continue
+            # Name inside the archive: "01 - Artist - Title.mp3"
+            ext = os.path.splitext(track.filepath)[1]
+            arc_name = f"{i:02d} - {track.artist} - {track.title}{ext}"
+            # Sanitise characters that are invalid in ZIP entry names
+            arc_name = re.sub(r'[<>:"/\\|?*]', "_", arc_name)
+            zf.write(track.filepath, arc_name)
+
+    logger.info("Created ZIP archive: %s (%d tracks)", archive_path, len(tracks))
+    return archive_path
+
+
+async def create_zip_archive(tracks: list[TrackInfo], archive_name: str) -> str:
+    """Compress *tracks* into a ZIP in a thread pool.  Returns the archive path."""
+    return await asyncio.to_thread(_create_zip, tracks, archive_name)

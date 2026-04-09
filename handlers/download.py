@@ -1,4 +1,6 @@
 import logging
+import os
+from datetime import datetime
 
 from aiogram import Bot, F, Router
 from aiogram.types import Message
@@ -10,12 +12,17 @@ from handlers.texts import (
     DOWNLOAD_COMPLETE,
     DRM_ERROR_TEXT,
     ERROR_TEXT,
-    FALLBACK_SEARCH_TEXT,
     TXT_PARSING,
     WAIT_TEXT,
+    ZIP_COMPLETE,
+    ZIP_CREATING,
+    ZIP_THRESHOLD_NOTICE,
 )
 from services.downloader import (
+    TrackInfo,
     cleanup_file,
+    cleanup_files,
+    create_zip_archive,
     download_album,
     download_track,
     get_album_info,
@@ -26,11 +33,12 @@ from services.queue_manager import QueueItem, QueueManager
 logger = logging.getLogger(__name__)
 router = Router()
 
+ZIP_THRESHOLD = 10
+
 _DRM_KEYWORDS = ("drm", "451", "geo", "unavailable for legal", "not available")
 
 
 def _is_drm_error(exc: Exception) -> bool:
-    """Check if a yt-dlp exception is DRM / geo-block related."""
     msg = str(exc).lower()
     return any(kw in msg for kw in _DRM_KEYWORDS)
 
@@ -41,6 +49,66 @@ def _get_queue_manager(bot: Bot) -> QueueManager:
         bot._queue_manager.start()  # type: ignore[attr-defined]
     return bot._queue_manager  # type: ignore[attr-defined]
 
+
+def _sanitize_filename(name: str) -> str:
+    """Remove characters that are unsafe for filenames."""
+    import re
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip("_ ")
+
+
+async def _send_tracks_individually(
+    tracks: list[TrackInfo], chat_id: int, bot: Bot
+) -> None:
+    """Enqueue tracks to be sent one-by-one as audio files."""
+    queue = _get_queue_manager(bot)
+    items = [
+        QueueItem(
+            chat_id=chat_id,
+            track=track,
+            caption=DOWNLOAD_COMPLETE.format(title=track.title, artist=track.artist),
+        )
+        for track in tracks
+    ]
+    await queue.enqueue_batch(items)
+
+
+async def _send_tracks_as_zip(
+    tracks: list[TrackInfo],
+    chat_id: int,
+    bot: Bot,
+    archive_label: str,
+    message: Message,
+) -> None:
+    """Compress tracks into a ZIP, send it as a document, then clean up everything."""
+    safe_label = _sanitize_filename(archive_label) or "batch"
+    archive_name = f"IslandMusic_{safe_label}.zip"
+
+    status_msg = await message.answer(ZIP_CREATING, parse_mode="HTML")
+
+    track_paths = [t.filepath for t in tracks]
+    zip_path: str | None = None
+
+    try:
+        zip_path = await create_zip_archive(tracks, archive_name)
+
+        size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+        caption = ZIP_COMPLETE.format(
+            filename=archive_name, count=len(tracks), size_mb=size_mb
+        )
+
+        queue = _get_queue_manager(bot)
+        await queue.send_document(chat_id, zip_path, caption)
+        await status_msg.delete()
+    except Exception:
+        logger.exception("Failed to create/send ZIP archive")
+        await status_msg.edit_text(ERROR_TEXT, parse_mode="HTML")
+    finally:
+        cleanup_files(track_paths)
+        if zip_path:
+            cleanup_file(zip_path)
+
+
+# ── .txt file handler ────────────────────────────────────────────────
 
 @router.message(F.document)
 async def handle_txt_file(message: Message, bot: Bot) -> None:
@@ -62,23 +130,25 @@ async def handle_txt_file(message: Message, bot: Bot) -> None:
         await message.answer("📁 Файл пуст или не содержит треков.", parse_mode="HTML")
         return
 
-    await message.answer(
-        TXT_PARSING.format(count=len(lines)), parse_mode="HTML"
-    )
+    use_zip = len(lines) > ZIP_THRESHOLD
 
-    queue = _get_queue_manager(bot)
-    success_count = 0
+    if use_zip:
+        await message.answer(ZIP_THRESHOLD_NOTICE, parse_mode="HTML")
+    else:
+        await message.answer(
+            TXT_PARSING.format(count=len(lines)), parse_mode="HTML"
+        )
+
+    downloaded: list[TrackInfo] = []
+    failed_lines: list[str] = []
 
     for line in lines:
         try:
             track = await download_track(line)
-            caption = DOWNLOAD_COMPLETE.format(title=track.title, artist=track.artist)
-            await queue.enqueue(
-                QueueItem(chat_id=message.chat.id, track=track, caption=caption)
-            )
-            success_count += 1
+            downloaded.append(track)
         except (DownloadError, ExtractorError) as exc:
             logger.warning("yt-dlp error for '%s': %s", line, exc)
+            failed_lines.append(line)
             if _is_drm_error(exc):
                 await message.answer(DRM_ERROR_TEXT, parse_mode="HTML")
             else:
@@ -87,18 +157,29 @@ async def handle_txt_file(message: Message, bot: Bot) -> None:
                     parse_mode="HTML",
                 )
         except Exception:
-            logger.exception("Unexpected error downloading from txt: %s", line)
+            logger.exception("Unexpected error downloading: %s", line)
+            failed_lines.append(line)
             await message.answer(
                 f"⚠️ Не удалось загрузить: <code>{line}</code>",
                 parse_mode="HTML",
             )
 
-    if success_count > 0:
-        await message.answer(
-            f"✅ Поставлено в очередь: <b>{success_count}/{len(lines)}</b> треков",
-            parse_mode="HTML",
-        )
+    if not downloaded:
+        return
 
+    if use_zip:
+        date_label = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        await _send_tracks_as_zip(downloaded, message.chat.id, bot, date_label, message)
+    else:
+        await _send_tracks_individually(downloaded, message.chat.id, bot)
+
+    await message.answer(
+        f"✅ Загружено: <b>{len(downloaded)}/{len(lines)}</b> треков",
+        parse_mode="HTML",
+    )
+
+
+# ── Text / URL handler ───────────────────────────────────────────────
 
 @router.message(F.text)
 async def handle_text(message: Message, bot: Bot) -> None:
@@ -144,6 +225,8 @@ async def handle_text(message: Message, bot: Bot) -> None:
         await status_msg.edit_text(ERROR_TEXT, parse_mode="HTML")
 
 
+# ── Album handler ─────────────────────────────────────────────────────
+
 async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
     try:
         album_info = await get_album_info(url)
@@ -151,20 +234,29 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
         entries = album_info.get("entries") or []
         track_count = len(list(entries))
 
-        await message.answer(
-            ALBUM_FOUND.format(title=album_title, count=track_count),
-            parse_mode="HTML",
-        )
+        use_zip = track_count > ZIP_THRESHOLD
+
+        if use_zip:
+            await message.answer(
+                ALBUM_FOUND.format(title=album_title, count=track_count)
+                + "\n\n"
+                + ZIP_THRESHOLD_NOTICE,
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(
+                ALBUM_FOUND.format(title=album_title, count=track_count),
+                parse_mode="HTML",
+            )
 
         tracks = await download_album(url)
-        queue = _get_queue_manager(bot)
 
-        items: list[QueueItem] = []
-        for track in tracks:
-            caption = DOWNLOAD_COMPLETE.format(title=track.title, artist=track.artist)
-            items.append(QueueItem(chat_id=message.chat.id, track=track, caption=caption))
-
-        await queue.enqueue_batch(items)
+        if use_zip:
+            await _send_tracks_as_zip(
+                tracks, message.chat.id, bot, album_title, message
+            )
+        else:
+            await _send_tracks_individually(tracks, message.chat.id, bot)
 
         await message.answer(
             ALBUM_COMPLETE.format(title=album_title, count=len(tracks)),

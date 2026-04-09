@@ -59,6 +59,37 @@ class QueueManager:
                 cleanup_file(item.track.filepath)
                 self._queue.task_done()
 
+    async def send_document(self, chat_id: int, filepath: str, caption: str) -> None:
+        """Send a file as a Telegram document (e.g. a ZIP archive) with retries."""
+        if not os.path.exists(filepath):
+            logger.error("Document not found: %s", filepath)
+            return
+
+        doc_file = FSInputFile(filepath)
+
+        for attempt in range(5):
+            try:
+                await self._bot.send_document(
+                    chat_id=chat_id,
+                    document=doc_file,
+                    caption=caption,
+                    parse_mode="HTML",
+                )
+                logger.info("Sent document '%s' to chat %d", filepath, chat_id)
+                return
+            except TelegramRetryAfter as e:
+                logger.warning(
+                    "Rate limited, retrying after %d seconds", e.retry_after
+                )
+                await asyncio.sleep(e.retry_after)
+            except Exception:
+                logger.exception(
+                    "Failed to send document (attempt %d/5)", attempt + 1
+                )
+                if attempt == 4:
+                    raise
+                await asyncio.sleep(2)
+
     async def _send_audio(self, item: QueueItem) -> None:
         if not os.path.exists(item.track.filepath):
             logger.error("File not found: %s", item.track.filepath)
