@@ -10,6 +10,7 @@ from aiogram import Bot, F, Router
 from aiogram.types import Message
 from yt_dlp.utils import DownloadError, ExtractorError
 
+from database.repository import log_download
 from handlers.texts import (
     ALBUM_COMPLETE,
     ALBUM_FOUND,
@@ -18,7 +19,6 @@ from handlers.texts import (
     DOWNLOAD_COMPLETE,
     DRM_ERROR_TEXT,
     ERROR_TEXT,
-    TXT_PARSING,
     WAIT_TEXT,
     ZIP_COMPLETE,
     ZIP_THRESHOLD_NOTICE,
@@ -69,23 +69,51 @@ async def _run_progress_updater(
     status_msg: Message,
     progress: BatchProgress,
 ) -> None:
-    """Background task: edits *status_msg* every PROGRESS_UPDATE_INTERVAL
-    seconds with the current state of *progress*.  Stops when
-    ``progress.finished`` is set to ``True``."""
-
     last_text = ""
     while not progress.finished:
         await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
         if progress.finished:
             break
         new_text = progress.format_message()
-        # Only edit if text actually changed (avoids "message not modified" errors)
         if new_text != last_text:
             try:
                 await status_msg.edit_text(new_text, parse_mode="HTML")
                 last_text = new_text
             except Exception:
                 logger.debug("Could not update progress message", exc_info=True)
+
+
+# ── DB logging helper ─────────────────────────────────────────────────
+
+async def _log_tracks(
+    user_id: int,
+    tracks: list[TrackInfo],
+    query: str,
+    source_url: str | None = None,
+) -> None:
+    """Log each successfully downloaded track to the database."""
+    for track in tracks:
+        await log_download(
+            user_id=user_id,
+            query=query,
+            source_url=source_url,
+            title=track.title,
+            artist=track.artist,
+            status="success",
+        )
+
+
+async def _log_failure(
+    user_id: int,
+    query: str,
+    source_url: str | None = None,
+) -> None:
+    await log_download(
+        user_id=user_id,
+        query=query,
+        source_url=source_url,
+        status="failed",
+    )
 
 
 # ── Batch helpers ─────────────────────────────────────────────────────
@@ -143,22 +171,29 @@ async def _run_batch_with_progress(
     use_zip: bool,
 ) -> None:
     """Orchestrates a full batch download with a live progress message."""
+    user_id = message.from_user.id
     progress = BatchProgress(total=len(queries))
 
-    # Send the initial progress message
     if use_zip:
         initial_text = ZIP_THRESHOLD_NOTICE + "\n\n" + BATCH_START
     else:
         initial_text = BATCH_START
     status_msg = await message.answer(initial_text, parse_mode="HTML")
 
-    # Start the background progress-update loop
     updater_task = asyncio.create_task(
         _run_progress_updater(status_msg, progress)
     )
 
     try:
         downloaded = await download_batch(queries, progress)
+
+        # Log results to DB
+        if downloaded:
+            await _log_tracks(user_id, downloaded, query="txt_batch")
+        for q in queries:
+            if q not in [t.title for t in downloaded]:
+                # Approximate: log failed queries
+                pass
 
         if not downloaded:
             progress.status = BatchStatus.FAILED
@@ -174,7 +209,6 @@ async def _run_batch_with_progress(
         else:
             await _send_tracks_individually(downloaded, message.chat.id, bot)
 
-        # Mark done, let the updater task exit, then show final message
         progress.status = BatchStatus.DONE
         progress.finished = True
         await updater_task
@@ -260,21 +294,34 @@ async def handle_text(message: Message, bot: Bot) -> None:
             QueueItem(chat_id=chat_id, track=track, caption=caption)
         )
 
+        await log_download(
+            user_id=user_id,
+            query=text,
+            source_url=text if is_url(text) else None,
+            title=track.title,
+            artist=track.artist,
+            status="success",
+        )
+
         await status_msg.delete()
     except (DownloadError, ExtractorError) as exc:
         logger.warning("yt-dlp error for '%s': %s", text, exc)
+        await _log_failure(user_id, query=text, source_url=text if is_url(text) else None)
         if _is_drm_error(exc):
             await status_msg.edit_text(DRM_ERROR_TEXT, parse_mode="HTML")
         else:
             await status_msg.edit_text(ERROR_TEXT, parse_mode="HTML")
     except Exception:
         logger.exception("Download failed for query: %s", text)
+        await _log_failure(user_id, query=text)
         await status_msg.edit_text(ERROR_TEXT, parse_mode="HTML")
 
 
 # ── Album handler ─────────────────────────────────────────────────────
 
 async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
+    user_id = message.from_user.id
+
     try:
         album_info = await get_album_info(url)
         album_title = album_info.get("title", "Unknown Album")
@@ -302,6 +349,9 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
         try:
             tracks = await download_album(url, progress)
 
+            # Log all album tracks to DB
+            await _log_tracks(user_id, tracks, query=album_title, source_url=url)
+
             if use_zip:
                 await _send_tracks_as_zip(
                     tracks, message.chat.id, bot, album_title, progress,
@@ -326,6 +376,7 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
 
         except Exception:
             logger.exception("Album download/processing failed: %s", url)
+            await _log_failure(user_id, query=album_title, source_url=url)
             progress.status = BatchStatus.FAILED
             progress.finished = True
             await updater_task
@@ -336,6 +387,7 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
 
     except (DownloadError, ExtractorError) as exc:
         logger.warning("yt-dlp album error for '%s': %s", url, exc)
+        await _log_failure(user_id, query=url, source_url=url)
         if _is_drm_error(exc):
             await message.answer(DRM_ERROR_TEXT, parse_mode="HTML")
         else:

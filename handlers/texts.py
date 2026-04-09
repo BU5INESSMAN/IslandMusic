@@ -25,17 +25,11 @@ DRM_ERROR_TEXT = (
     "Пожалуйста, напишите название трека текстом."
 )
 
-FALLBACK_SEARCH_TEXT = (
-    "🔄 <i>Прямая загрузка недоступна — ищу через YouTube...</i>"
-)
-
 DOWNLOAD_COMPLETE = "✅ <b>{title}</b> — {artist}"
 
 ALBUM_FOUND = "💿 Найден альбом: <b>{title}</b>\n📀 Треков: <b>{count}</b>\n\n⏳ Начинаю загрузку..."
 
 ALBUM_COMPLETE = "✅ Альбом <b>{title}</b> загружен! ({count} треков)"
-
-TXT_PARSING = "📋 Найдено <b>{count}</b> треков в файле. Начинаю загрузку..."
 
 ZIP_THRESHOLD_NOTICE = (
     "📦 В списке больше 10 треков. Чтобы не спамить, я соберу их в один архив..."

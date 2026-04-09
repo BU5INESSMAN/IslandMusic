@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m py_compile handlers/download.py)",
+      "Bash(python -c ':*)"
+    ]
+  }
+}
