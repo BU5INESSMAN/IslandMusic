@@ -244,9 +244,6 @@ def _build_yt_dlp_opts(output_dir: str, filename_prefix: str) -> dict:
         "fragment_retries": 3,
         "ignoreerrors": True,
         "cookiefile": "cookies.txt",
-        "extractor_args": {
-            "youtube": ["player_client=android", "player_skip=webpage"],
-        },
         "datebefore": CENSORSHIP_DATE,
     }
 
@@ -282,9 +279,6 @@ def _extract_info_no_download(query: str) -> dict:
         "noplaylist": True,
         "socket_timeout": 15,
         "cookiefile": "cookies.txt",
-        "extractor_args": {
-            "youtube": ["player_client=android", "player_skip=webpage"],
-        },
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(query, download=False)
@@ -511,9 +505,6 @@ async def get_album_info(url: str) -> dict:
         "noplaylist": False,
         "socket_timeout": 15,
         "cookiefile": "cookies.txt",
-        "extractor_args": {
-            "youtube": ["player_client=android", "player_skip=webpage"],
-        },
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = await asyncio.to_thread(ydl.extract_info, url, download=False)
