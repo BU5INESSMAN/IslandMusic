@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(python3 -m py_compile handlers/download.py)",
-      "Bash(python -c ':*)"
+      "Bash(python -c ':*)",
+      "Bash(python -m py_compile services/downloader.py)",
+      "Bash(python -m py_compile handlers/download.py)",
+      "Bash(python -m py_compile handlers/texts.py)"
     ]
   }
 }

@@ -268,7 +268,17 @@ def _build_album_opts(output_dir: str, filename_prefix: str) -> dict:
 def _extract_info(opts: dict, query: str) -> dict:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(query, download=True)
-        return info or {}
+        if not info:
+            return {}
+        # When using ytsearch, yt-dlp returns a playlist wrapper.
+        # Unwrap to the actual downloaded entry so metadata is correct.
+        if info.get("_type") == "playlist" or (
+            info.get("entries") and not info.get("artist") and not info.get("track")
+        ):
+            entries = [e for e in (info.get("entries") or []) if e]
+            if entries:
+                return entries[0]
+        return info
 
 
 def _extract_info_no_download(query: str) -> dict:

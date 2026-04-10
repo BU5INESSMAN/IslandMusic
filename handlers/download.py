@@ -18,6 +18,7 @@ from handlers.texts import (
     BATCH_ERROR,
     BATCH_START,
     CENSORED_ERROR_TEXT,
+    CENSORED_SKIP_TEXT,
     DOWNLOAD_COMPLETE,
     DRM_ERROR_TEXT,
     ERROR_TEXT,
@@ -76,20 +77,52 @@ def _sanitize_filename(name: str) -> str:
     return _UNSAFE_FILENAME_RE.sub("_", name).strip("_ ")
 
 
+def _format_user(user) -> str:
+    """Format user info for admin notifications."""
+    username = f"@{user.username}" if user.username else "N/A"
+    return f"👤 Имя: {html.escape(user.full_name)} | {username} | ID: {user.id}"
+
+
 def _schedule_admin_notification(bot: Bot, text: str) -> None:
     asyncio.create_task(notify_admins(bot, text))
 
 
-def _schedule_error_notifications(bot: Bot, user_id: int, error_msg: str) -> None:
+def _is_censored_error(error_msg: str) -> bool:
+    """Check if the error is an expected censorship skip (no admin alert needed)."""
+    return "no uncensored version found" in error_msg.lower()
+
+
+def _is_cookie_error(error_msg: str) -> bool:
+    return any(keyword in error_msg.lower() for keyword in _COOKIE_ALERT_KEYWORDS)
+
+
+def _schedule_error_notifications(
+    bot: Bot,
+    user,
+    error_msg: str,
+    *,
+    cookie_alert_sent: bool = False,
+) -> bool:
+    """Send admin notifications for download errors.
+
+    Returns updated ``cookie_alert_sent`` flag so callers can deduplicate
+    cookie alerts within a batch.
+
+    Censored-track errors are expected and never trigger admin alerts.
+    """
+    if _is_censored_error(error_msg):
+        return cookie_alert_sent
+
     safe_error = html.escape(error_msg)
+    user_info = _format_user(user)
     _schedule_admin_notification(
         bot,
         (
-            "⚠️ <b>Ошибка загрузки:</b> "
-            f"У пользователя {user_id} не скачался трек.\nОшибка: {safe_error}"
+            f"⚠️ <b>Ошибка загрузки:</b>\n{user_info}\n"
+            f"Ошибка: {safe_error}"
         ),
     )
-    if any(keyword in error_msg.lower() for keyword in _COOKIE_ALERT_KEYWORDS):
+    if _is_cookie_error(error_msg) and not cookie_alert_sent:
         _schedule_admin_notification(
             bot,
             (
@@ -98,6 +131,8 @@ def _schedule_error_notifications(bot: Bot, user_id: int, error_msg: str) -> Non
                 "Пожалуйста, обновите куки на сервере."
             ),
         )
+        return True
+    return cookie_alert_sent
 
 
 # ── Progress updater (event-driven with debounce) ────────────────────
@@ -244,7 +279,8 @@ async def _run_batch_with_progress(
     use_zip: bool,
 ) -> None:
     """Orchestrates a full batch download with a live progress message."""
-    user_id = message.from_user.id
+    user = message.from_user
+    user_id = user.id
     progress = BatchProgress(total=len(queries))
 
     if use_zip:
@@ -258,13 +294,29 @@ async def _run_batch_with_progress(
     )
 
     try:
+        # Track cookie alert dedup across the whole batch
+        _cookie_alert_sent = False
+
         async def _on_track_error(failed_query: str, exc: Exception) -> None:
+            nonlocal _cookie_alert_sent
             await _log_failure(
                 user_id,
                 query=failed_query,
                 source_url=failed_query if is_url(failed_query) else None,
             )
-            _schedule_error_notifications(bot, user_id, str(exc))
+            # Notify user about censored track skips (expected, no admin alert)
+            if isinstance(exc, CensoredTrackError):
+                try:
+                    await message.answer(
+                        CENSORED_SKIP_TEXT.format(query=html.escape(failed_query)),
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+                return
+            _cookie_alert_sent = _schedule_error_notifications(
+                bot, user, str(exc), cookie_alert_sent=_cookie_alert_sent,
+            )
 
         downloaded = await download_batch(queries, progress, on_error=_on_track_error)
 
@@ -332,12 +384,10 @@ async def handle_txt_file(message: Message, bot: Bot) -> None:
 
     use_zip = len(lines) > ZIP_THRESHOLD
     date_label = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    user_info = _format_user(message.from_user)
     _schedule_admin_notification(
         bot,
-        (
-            "📥 <b>Скачивание:</b> "
-            f"Пользователь {message.from_user.id} запустил загрузку {len(lines)} треков."
-        ),
+        f"📥 <b>Скачивание:</b>\n{user_info}\nЗагрузка {len(lines)} треков.",
     )
 
     await _run_batch_with_progress(
@@ -392,12 +442,12 @@ async def handle_text(message: Message, bot: Bot) -> None:
     except CensoredTrackError as exc:
         logger.warning("Censored track for '%s': %s", text, exc)
         await _log_failure(user_id, query=text, source_url=text if is_url(text) else None)
-        _schedule_error_notifications(bot, user_id, str(exc))
+        # Censored tracks are expected — no admin notification
         await status_msg.edit_text(CENSORED_ERROR_TEXT, parse_mode="HTML")
     except (DownloadError, ExtractorError) as exc:
         logger.warning("yt-dlp error for '%s': %s", text, exc)
         await _log_failure(user_id, query=text, source_url=text if is_url(text) else None)
-        _schedule_error_notifications(bot, user_id, str(exc))
+        _schedule_error_notifications(bot, message.from_user, str(exc))
         if _is_drm_error(exc):
             await status_msg.edit_text(DRM_ERROR_TEXT, parse_mode="HTML")
         else:
@@ -405,7 +455,7 @@ async def handle_text(message: Message, bot: Bot) -> None:
     except Exception as exc:
         logger.exception("Download failed for query: %s", text)
         await _log_failure(user_id, query=text)
-        _schedule_error_notifications(bot, user_id, str(exc))
+        _schedule_error_notifications(bot, message.from_user, str(exc))
         await status_msg.edit_text(ERROR_TEXT, parse_mode="HTML")
 
 
@@ -422,12 +472,10 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
 
         use_zip = track_count > ZIP_THRESHOLD
 
+        user_info = _format_user(message.from_user)
         _schedule_admin_notification(
             bot,
-            (
-                "📥 <b>Скачивание:</b> "
-                f"Пользователь {user_id} запустил загрузку {track_count} треков."
-            ),
+            f"📥 <b>Скачивание:</b>\n{user_info}\nЗагрузка {track_count} треков.",
         )
 
         await message.answer(
@@ -478,7 +526,7 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
         except Exception as exc:
             logger.exception("Album download/processing failed: %s", url)
             await _log_failure(user_id, query=album_title, source_url=url)
-            _schedule_error_notifications(bot, user_id, str(exc))
+            _schedule_error_notifications(bot, message.from_user, str(exc))
             progress.status = BatchStatus.FAILED
             progress.finished = True
             await updater_task
@@ -490,17 +538,17 @@ async def _handle_album_download(message: Message, bot: Bot, url: str) -> None:
     except CensoredTrackError as exc:
         logger.warning("Censored album for '%s': %s", url, exc)
         await _log_failure(user_id, query=url, source_url=url)
-        _schedule_error_notifications(bot, user_id, str(exc))
+        # Censored tracks are expected — no admin notification
         await message.answer(CENSORED_ERROR_TEXT, parse_mode="HTML")
     except (DownloadError, ExtractorError) as exc:
         logger.warning("yt-dlp album error for '%s': %s", url, exc)
         await _log_failure(user_id, query=url, source_url=url)
-        _schedule_error_notifications(bot, user_id, str(exc))
+        _schedule_error_notifications(bot, message.from_user, str(exc))
         if _is_drm_error(exc):
             await message.answer(DRM_ERROR_TEXT, parse_mode="HTML")
         else:
             await message.answer(ERROR_TEXT, parse_mode="HTML")
     except Exception as exc:
         logger.exception("Album download failed: %s", url)
-        _schedule_error_notifications(bot, user_id, str(exc))
+        _schedule_error_notifications(bot, message.from_user, str(exc))
         await message.answer(ERROR_TEXT, parse_mode="HTML")
